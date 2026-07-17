@@ -1,0 +1,8 @@
+sketch: src
+fqbn: esp32:esp32:esp32
+build:
+  cache:
+    compilations: 5
+upload:
+  port: COM3
+  speed: 921600
