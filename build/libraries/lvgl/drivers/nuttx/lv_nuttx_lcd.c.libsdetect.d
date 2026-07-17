@@ -1,0 +1,30 @@
+lv_nuttx_lcd.o: \
+ C:\Users\biggi\OneDrive\Documents\Arduino\libraries\lvgl\src\drivers\nuttx\lv_nuttx_lcd.c \
+ C:\Users\biggi\OneDrive\Documents\Arduino\libraries\lvgl\src\drivers\nuttx\lv_nuttx_lcd.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/display/lv_display.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_types.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/lv_conf_internal.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/lv_conf_kconfig.h \
+ C:\Users\biggi\AppData\Local\Arduino15\packages\esp32\tools\esp32-libs\3.3.10/qio_qspi/include/sdkconfig.h \
+ C:\Users\biggi\AppData\Local\Arduino15\packages\esp32\tools\esp32-libs\3.3.10/include/esp_common/include/esp_attr.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lv_conf.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_timer.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/tick/lv_tick.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/lv_conf_internal.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_types.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_types.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_ll.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_event.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_array.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_color.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_assert.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_log.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/stdlib/lv_mem.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/lv_conf_internal.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/stdlib/lv_string.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_types.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_math.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_palette.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_color.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_color_op.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_area.h

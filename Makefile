@@ -1,6 +1,6 @@
 .PHONY: compile upload verify clean help
 
-FQBN = esp32:esp32:esp32
+FQBN = esp32:esp32:esp32s3
 PORT ?= COM3
 BAUD = 921600
 

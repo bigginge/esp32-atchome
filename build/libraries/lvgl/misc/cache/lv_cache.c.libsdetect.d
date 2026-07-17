@@ -1,0 +1,36 @@
+lv_cache.o: \
+ C:\Users\biggi\OneDrive\Documents\Arduino\libraries\lvgl\src\misc\cache\lv_cache.c \
+ C:\Users\biggi\OneDrive\Documents\Arduino\libraries\lvgl\src\misc\cache\lv_cache.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_types.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/lv_conf_internal.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/lv_conf_kconfig.h \
+ C:\Users\biggi\AppData\Local\Arduino15\packages\esp32\tools\esp32-libs\3.3.10/qio_qspi/include/sdkconfig.h \
+ C:\Users\biggi\AppData\Local\Arduino15\packages\esp32\tools\esp32-libs\3.3.10/include/esp_common/include/esp_attr.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lv_conf.h \
+ C:\Users\biggi\OneDrive\Documents\Arduino\libraries\lvgl\src\misc\cache\lv_cache_entry.h \
+ C:\Users\biggi\OneDrive\Documents\Arduino\libraries\lvgl\src\misc\cache\class/lv_cache_class.h \
+ C:\Users\biggi\OneDrive\Documents\Arduino\libraries\lvgl\src\misc\cache\class/lv_cache_lru_rb.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/cache/lv_cache_private.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_types.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/osal/lv_os_private.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/lv_conf_internal.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/osal/lv_os.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_types.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/osal/lv_os_none.h \
+ C:\Users\biggi\OneDrive\Documents\Arduino\libraries\lvgl\src\misc\cache\class/lv_cache_lru_ll.h \
+ C:\Users\biggi\OneDrive\Documents\Arduino\libraries\lvgl\src\misc\cache\class/lv_cache_sc_da.h \
+ C:\Users\biggi\OneDrive\Documents\Arduino\libraries\lvgl\src\misc\cache\instance/lv_cache_instance.h \
+ C:\Users\biggi\OneDrive\Documents\Arduino\libraries\lvgl\src\misc\cache\instance/lv_image_header_cache.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_types.h \
+ C:\Users\biggi\OneDrive\Documents\Arduino\libraries\lvgl\src\misc\cache\instance/lv_image_cache.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/stdlib/lv_sprintf.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_types.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_assert.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_log.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_types.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/stdlib/lv_mem.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/lv_conf_internal.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/stdlib/lv_string.h \
+ C:\Users\biggi\OneDrive\Documents\Arduino\libraries\lvgl\src\misc\cache\lv_cache_entry_private.h \
+ C:\Users\biggi\OneDrive\Documents\Arduino\libraries\lvgl\src\misc\cache\lv_cache_private.h \
+ C:/Users/biggi/OneDrive/Documents/Arduino/libraries/lvgl/src/misc/lv_profiler.h

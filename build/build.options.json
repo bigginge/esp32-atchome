@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "..\\..,..\\..\\..,..\\..\\..",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:esp32",
+  "hardwareFolders": "C:\\Users\\biggi\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.10,C:\\Users\\biggi\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.10",
+  "otherLibrariesFolders": "C:\\Users\\biggi\\OneDrive\\Documents\\Arduino\\libraries",
+  "sketchLocation": "C:\\repos\\esp32-atchome"
+}

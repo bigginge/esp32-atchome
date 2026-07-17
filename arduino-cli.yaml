@@ -1,5 +1,5 @@
 sketch: src
-fqbn: esp32:esp32:esp32
+fqbn: esp32:esp32:esp32s3
 build:
   cache:
     compilations: 5
