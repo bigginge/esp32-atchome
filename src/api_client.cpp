@@ -9,6 +9,17 @@
 
 static constexpr uint16_t kHttpTimeoutMs = 4000;
 
+static void sanitizeAscii(char *str) {
+  if (str == nullptr) return;
+  char *dst = str;
+  for (char *src = str; *src; ++src) {
+    if ((static_cast<unsigned char>(*src) & 0x80) == 0) {
+      *dst++ = *src;
+    }
+  }
+  *dst = '\0';
+}
+
 static void safeJsonCopy(char *dest, size_t destSize, JsonObject obj, const char *key) {
   dest[0] = '\0';
   if (!obj[key].is<const char *>()) {
@@ -24,6 +35,7 @@ static void safeJsonCopy(char *dest, size_t destSize, JsonObject obj, const char
   while (len > 0 && dest[len - 1] == ' ') {
     dest[--len] = '\0';
   }
+  sanitizeAscii(dest);
 }
 
 static void clearSnapshotFields(Aircraft &ac) {
@@ -126,7 +138,7 @@ bool fetchNearbyAircraft(float homeLat, float homeLon, int radiusNm,
     if (ac["gs"].is<float>()) {
       dst.groundSpeedKts = ac["gs"].as<float>();
     } else if (ac["gs"].is<int>()) {
-      dst.groundSpeedKts = static_cast<float>(ac["gs"].as<int>());
+      dst.groundSpeedKts = static_cast<float>(ac["gs"].is<int>());
     }
 
     if (ac["track"].is<float>()) {
@@ -226,6 +238,7 @@ static bool fetchAirportInfo(const char *icao, char *buffer, size_t bufferSize) 
   if (doc["airport"].is<const char *>() && doc["country_code"].is<const char *>()) {
     snprintf(buffer, bufferSize, "%s, %s", doc["airport"].as<const char *>(),
              doc["country_code"].as<const char *>());
+    sanitizeAscii(buffer);
     return true;
   }
   return false;

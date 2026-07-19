@@ -1,5 +1,6 @@
 #include "info_panel.hpp"
 
+#include <Arduino.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -68,9 +69,7 @@ void InfoPanel::create(lv_obj_t *parent) {
   lv_obj_add_flag(fieldsCont_, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(fieldsCont_, LV_OBJ_FLAG_SCROLLABLE);
 
-  addField(fieldsCont_, "Manufacturer", &manufacturer_);
-  addField(fieldsCont_, "Type", &type_);
-  addField(fieldsCont_, "Registration", &registration_);
+  addField(fieldsCont_, "Aircraft", &aircraft_);
   addField(fieldsCont_, "Flight", &flight_);
   addField(fieldsCont_, "Distance", &distance_);
   addField(fieldsCont_, "Origin", &origin_);
@@ -81,10 +80,12 @@ void InfoPanel::setField(lv_obj_t *valueLabel, const char *value) {
   if (valueLabel == nullptr) {
     return;
   }
+  lv_obj_t *block = lv_obj_get_parent(valueLabel);
   if (value == nullptr || value[0] == '\0') {
-    lv_label_set_text(valueLabel, "—");
+    lv_obj_add_flag(block, LV_OBJ_FLAG_HIDDEN);
   } else {
     lv_label_set_text(valueLabel, value);
+    lv_obj_clear_flag(block, LV_OBJ_FLAG_HIDDEN);
   }
 }
 
@@ -116,15 +117,57 @@ void InfoPanel::showAircraft(const Aircraft *aircraft) {
   const char *flightText =
       aircraft->callsign[0] != '\0' ? aircraft->callsign : aircraft->hex;
 
-  setField(manufacturer_, aircraft->manufacturer);
-  setField(type_, typeText);
-  setField(registration_, aircraft->registration);
-  setField(flight_, flightText);
+  String buf;
+  buf.reserve(128);
+
+  if (aircraft->manufacturer[0]) buf += aircraft->manufacturer;
+  if (typeText[0]) {
+    if (buf.length()) buf += " ";
+    buf += typeText;
+  }
+  if (aircraft->registration[0]) {
+    if (buf.length()) buf += " ";
+    buf += "(";
+    buf += aircraft->registration;
+    buf += ")";
+  }
+  setField(aircraft_, buf.c_str());
+
+  buf = "";
+  if (aircraft->registeredOwner[0]) {
+    buf += aircraft->registeredOwner;
+    buf += " ";
+  }
+  if (flightText[0]) buf += flightText;
+  setField(flight_, buf.c_str());
 
   char distBuf[32];
   snprintf(distBuf, sizeof(distBuf), "%.1f nm", aircraft->distanceNm);
   setField(distance_, distBuf);
 
-  setField(origin_, aircraft->origin);
-  setField(destination_, aircraft->destination);
+  buf = "";
+  if (aircraft->origin[0]) buf += aircraft->origin;
+  if (aircraft->originIcao[0]) {
+    if (buf.length() > 0 && strcmp(aircraft->origin, aircraft->originIcao) != 0) {
+      buf += " (";
+      buf += aircraft->originIcao;
+      buf += ")";
+    } else if (buf.length() == 0) {
+      buf += aircraft->originIcao;
+    }
+  }
+  setField(origin_, buf.c_str());
+
+  buf = "";
+  if (aircraft->destination[0]) buf += aircraft->destination;
+  if (aircraft->destinationIcao[0]) {
+    if (buf.length() > 0 && strcmp(aircraft->destination, aircraft->destinationIcao) != 0) {
+      buf += " (";
+      buf += aircraft->destinationIcao;
+      buf += ")";
+    } else if (buf.length() == 0) {
+      buf += aircraft->destinationIcao;
+    }
+  }
+  setField(destination_, buf.c_str());
 }

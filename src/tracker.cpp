@@ -6,6 +6,7 @@
 void Tracker::clear() {
   count_ = 0;
   selectedHex_[0] = '\0';
+  autoSelected_ = true;
   memset(aircraft_, 0, sizeof(aircraft_));
 }
 
@@ -113,8 +114,9 @@ void Tracker::mergeSnapshot(const Aircraft *incoming, size_t count) {
 
   if (selectedHex_[0] != '\0' && findByHex(selectedHex_) == nullptr) {
     selectedHex_[0] = '\0';
+    autoSelected_ = true;
   }
-  if (selectedHex_[0] == '\0') {
+  if (autoSelected_) {
     selectNearest();
   }
 }
@@ -171,6 +173,11 @@ Aircraft *Tracker::selectNearestTo(float eastNm, float northNm, float hitRadiusN
 
   if (best != nullptr) {
     selectByHex(best->hex);
+    autoSelected_ = false;
+  } else {
+    selectedHex_[0] = '\0';
+    autoSelected_ = true;
+    selectNearest();
   }
   return best;
 }

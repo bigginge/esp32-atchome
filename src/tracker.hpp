@@ -11,6 +11,8 @@ class Tracker {
   const Aircraft *aircraft() const { return aircraft_; }
   Aircraft *aircraft() { return aircraft_; }
 
+  bool isAutoSelected() const { return autoSelected_; }
+
   Aircraft *selected();
   const Aircraft *selected() const;
 
@@ -34,4 +36,5 @@ class Tracker {
   Aircraft aircraft_[kMaxAircraft];
   size_t count_ = 0;
   char selectedHex_[8] = {0};
+  bool autoSelected_ = true;
 };

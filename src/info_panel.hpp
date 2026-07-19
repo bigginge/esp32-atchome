@@ -18,9 +18,7 @@ class InfoPanel {
 
   lv_obj_t *panel_ = nullptr;
   lv_obj_t *statusLabel_ = nullptr;
-  lv_obj_t *manufacturer_ = nullptr;
-  lv_obj_t *type_ = nullptr;
-  lv_obj_t *registration_ = nullptr;
+  lv_obj_t *aircraft_ = nullptr;
   lv_obj_t *flight_ = nullptr;
   lv_obj_t *distance_ = nullptr;
   lv_obj_t *origin_ = nullptr;

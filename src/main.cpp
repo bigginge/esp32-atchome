@@ -152,7 +152,11 @@ static void fetchAndUpdate() {
   const bool ok = fetchNearbyAircraft(MY_LATITUDE, MY_LONGITUDE, SEARCH_RADIUS_NM,
                                       snapshot, kMaxAircraft, &count);
   if (!ok) {
-    infoPanel.showStatus("Fetch failed");
+    if (tracker.selected() == nullptr) {
+      infoPanel.showStatus("Fetch failed");
+    } else {
+      refreshInfoPanel();
+    }
     fetchInProgress = false;
     lastFetchMs = millis();
     return;
@@ -166,6 +170,7 @@ static void fetchAndUpdate() {
     lastEnrichedHex[0] = '\0';
   } else {
     enrichSelectedIfNeeded();
+    refreshInfoPanel();
   }
 
   lastFetchMs = millis();
