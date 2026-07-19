@@ -1,5 +1,8 @@
-sketch: src
-fqbn: esp32:esp32:esp32s3
+board_manager:
+  additional_urls:
+    - https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+fqbn: esp32:esp32:esp32s3:PSRAM=opi,FlashMode=qio,FlashSize=4M,PartitionScheme=huge_app,CDCOnBoot=cdc,USBMode=hwcdc
 build:
   cache:
     compilations: 5

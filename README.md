@@ -1,125 +1,82 @@
 # esp32-atchome
-ESP32 Home Air Traffic Control
+
+ESP32 Home Air Traffic Control for the CrowPanel ESP32-S3 7" display.
+
+Live ADS-B traffic on a square radar (left) with an aircraft detail panel (right).
 
 ## Hardware
 
-CrowPanel ESP32-S3 HMI Display Module (7") P/N: DIS08070H
-- **Microcontroller**: ESP32-S3 (Dual Core, 240MHz, 8MB PSRAM)
-- **Display**: ILI9488 800x480 TFT (SPI interface)
-- **Touch**: FT6236G Capacitive Touchscreen (I2C interface)
+**CrowPanel ESP32-S3 HMI 7" (DIS08070H)**
 
-## Test Project: Display and Touch Demo
+| Part | Detail |
+| --- | --- |
+| MCU | ESP32-S3-WROOM-1-N4R8 (OPI PSRAM) |
+| Display | 800×480 RGB TFT |
+| Touch | GT911 capacitive, I2C SDA **19** / SCL **20** |
+| Touch reset | PCA9557 at **0x18** |
+| Backlight | GPIO **2** |
 
-This minimal test project demonstrates successful programming of the ESP32-S3 with display and touch functionality.
+## Features
 
-### Current Status
-✅ **Successfully uploaded and running on ESP32-S3 (COM3)**
-- Sketch compiles and uploads without errors
-- I2C bus scanner detects connected I2C devices (FT6236 at address 0x38 when connected)
-- Serial output confirmed via 115200 baud monitor
+- **Radar** (480×480): concentric range rings centred on your location; aircraft symbols oriented by track with altitude-aware colour and trails (lower altitude = more distinct trails)
+- **Info panel** (320×480): manufacturer, type, registration, flight number, distance (nm), origin and destination airports
+- **Touch select**: tap an aircraft to highlight it and load details; selection clears when it leaves range; defaults to the nearest aircraft
+- **Data**: [adsb.fi](https://adsb.fi/) positions; [hexdb.io](https://hexdb.io/) aircraft and route enrichment (lazy, for the selection)
 
-### Features
-- Initializes I2C for touch controller detection
-- Scans I2C bus every 5 seconds for connected devices
-- Reports device addresses (ready for display/touch integration)
-- Foundation for LVGL graphics and touch handling
+## Prerequisites
 
-### Quick Start
+- Arduino CLI 1.5+
+- ESP32 board package: `arduino-cli core install esp32:esp32`
+- Libraries:
 
-**Prerequisites:**
-- Arduino CLI v1.5+ installed
-- ESP32 board support installed (3.3.10+)
-- USB cable connected to ESP32-S3 (COM3 or your port)
-
-**Build:**
 ```bash
-# Using Arduino CLI directly
-arduino-cli compile --fqbn esp32:esp32:esp32s3 .
-
-# Using Makefile (Windows)
-make compile
+arduino-cli lib install "lvgl" "LovyanGFX" "PCA9557-arduino" "ArduinoJson"
 ```
 
-**Upload:**
+Board index (see `arduino-cli.yaml`):
+
+`https://espressif.github.io/arduino-esp32/package_esp32_index.json`
+
+## Configuration
+
 ```bash
-# Using Arduino CLI (replace COM3 with your port)
-arduino-cli upload --fqbn esp32:esp32:esp32s3 --port COM3 .
-
-# Using Makefile
-PORT=COM3 make upload
-
-# Or just
-make all  # Compiles and uploads
+cp config.example.h config.h
 ```
 
-**Verify Execution:**
-1. After upload completes, open serial monitor at 115200 baud
-2. You should see: "===== ESP32 Display and Touch Demo ====="
-3. You should see: "I2C initialized successfully!"
-4. Every 5 seconds, you will see "Scanning I2C bus..." followed by device detection
-5. When FT6236 is connected, you should see: "I2C device found at address 0x38"
+Edit `config.h`: WiFi SSID/password, latitude/longitude, search radius, refresh interval.  
+`config.h` is gitignored.
 
-### Pin Configuration
+## Build / upload
 
-**Display (ILI9488 via SPI):**
-- GPIO 18: CLK
-- GPIO 23: MOSI
-- GPIO 19: MISO
-- GPIO 5: CS
-- GPIO 2: DC
-- GPIO 4: RST
+```powershell
+$fqbn = "esp32:esp32:esp32s3:PSRAM=opi,FlashMode=qio,FlashSize=4M,PartitionScheme=huge_app,CDCOnBoot=cdc,USBMode=hwcdc"
+arduino-cli compile --fqbn $fqbn --build-property "compiler.cpp.extra_flags=-I$PWD -DLV_CONF_INCLUDE_SIMPLE" .
+arduino-cli upload --fqbn $fqbn --port COM3 --upload-property upload.speed=921600 .
+```
 
-**Touch (FT6236 via I2C):**
-- GPIO 21: SDA
-- GPIO 22: SCL
-- I2C Address: 0x38
+Or: `make compile` / `make PORT=COM3 upload`
 
-### Project Structure
+## Project layout
+
 ```
 esp32-atchome/
-├── esp32-atchome.ino      # Main sketch (entry point)
-├── src/                   # Source code
-│   └── main.cpp          # Display and touch logic
-├── lib/                   # Libraries
-│   └── lv_conf.h         # LVGL configuration
-├── build/                # Compiled output
-├── arduino-cli.yaml      # Arduino CLI configuration
-├── Makefile             # Build automation
-└── README.md            # This file
+├── esp32-atchome.ino
+├── config.example.h
+├── config.h                 # local, gitignored
+├── lv_conf.h
+├── src/
+│   ├── main.cpp
+│   ├── crowpanel_display.hpp
+│   ├── aircraft.hpp
+│   ├── geo.hpp
+│   ├── api_client.cpp/.hpp
+│   ├── tracker.cpp/.hpp
+│   ├── radar_view.cpp/.hpp
+│   └── info_panel.cpp/.hpp
+├── Makefile
+└── README.md
 ```
 
-### Troubleshooting
+## Serial
 
-**Upload fails with "Wrong chip argument":**
-- Device is ESP32-S3, not regular ESP32
-- Use FQBN: `esp32:esp32:esp32s3` (already configured in arduino-cli.yaml)
-
-**No serial output:**
-- Verify COM port is correct: `arduino-cli board list`
-- Ensure baud rate is 115200
-- Try holding RESET button after upload
-
-**No I2C devices found:**
-- FT6236 touch controller may not be connected
-- Verify I2C connections (GPIO 21 SDA, GPIO 22 SCL)
-- Check I2C address with external I2C scanner
-
-### Next Steps: Full Display and Touch Demo
-
-The current sketch is a simplified I2C bus scanner. To add full LVGL graphics and touch support:
-
-1. **Resolve LVGL Version**: 
-   - LVGL 9.5.0 is installed but uses different API than the original sketch (designed for LVGL 8)
-   - Option A: Downgrade to LVGL 8.3.11: `arduino-cli lib install "lvgl:8.3.11"`
-   - Option B: Rewrite sketch for LVGL 9 API (more complex, more modern)
-   - Option C: Use alternative TFT driver (TFT_eSPI, etc.)
-
-2. **Implement Display Driver**: Initialize ILI9488 over SPI with custom flush callback
-
-3. **Implement Touch Driver**: Add FT6236 touch event handling with LVGL integration
-
-4. **Graphics Demo**: Create LVGL UI with rectangle that responds to touch events
-
-**Current Files:**
-- `esp32-atchome.ino`: Active simplified I2C demo
-- `src/main.cpp.bak`: Original LVGL 8 design (requires LVGL 9 API updates to compile)
+115200 baud. Expect WiFi connect, ADS-B fetch logs, then a live radar display.

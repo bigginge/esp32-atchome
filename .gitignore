@@ -1,0 +1,17 @@
+# Sensitive configuration (WiFi password and location)
+config.h
+
+# Arduino / local build artifacts
+build/
+*.o
+*.elf
+*.bin
+*.map
+.pio/
+
+# Editor and system files
+.vscode/
+*.bak
+*~
+.DS_Store
+Thumbs.db
