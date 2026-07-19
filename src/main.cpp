@@ -33,6 +33,7 @@ static char lastEnrichedHex[8] = {0};
 static unsigned long lastEnrichmentAttemptMs = 0;
 static bool lastEnrichmentAttemptFailed = false;
 static bool fetchInProgress = false;
+static unsigned long lastPosUpdateMs = 0;
 
 static constexpr unsigned long kEnrichmentSuccessIntervalMs = 1200;
 static constexpr unsigned long kEnrichmentRetryIntervalMs = 5000;
@@ -272,7 +273,7 @@ void loop() {
     enrichSelectedIfNeeded();
   }
 
-  const unsigned long now = millis();
+  unsigned long now = millis();
   if (!fetchInProgress && (lastFetchMs == 0 || now - lastFetchMs >= REFRESH_INTERVAL_MS)) {
     if (WiFi.status() != WL_CONNECTED) {
       connectWiFi();
@@ -280,6 +281,16 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED) {
       fetchAndUpdate();
     }
+  }
+
+  now = millis();
+  if (lastPosUpdateMs == 0) {
+    lastPosUpdateMs = now;
+  } else if (now - lastPosUpdateMs >= 100) { // 10 FPS update
+    float dt = (now - lastPosUpdateMs) / 1000.0f;
+    lastPosUpdateMs = now;
+    tracker.updatePositions(dt);
+    radarView.redraw();
   }
 
   delay(5);

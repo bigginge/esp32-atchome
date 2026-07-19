@@ -26,6 +26,7 @@ class Tracker {
   Aircraft *selectNearestTo(float eastNm, float northNm, float hitRadiusNm);
 
   bool hasSelection() const { return selectedHex_[0] != '\0'; }
+  void updatePositions(float dtSeconds);
 
  private:
   Aircraft *findByHex(const char *hex);

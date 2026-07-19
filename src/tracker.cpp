@@ -181,3 +181,16 @@ Aircraft *Tracker::selectNearestTo(float eastNm, float northNm, float hitRadiusN
   }
   return best;
 }
+
+void Tracker::updatePositions(float dtSeconds) {
+    for (size_t i = 0; i < count_; ++i) {
+        Aircraft &ac = aircraft_[i];
+        if (ac.groundSpeedKts > 0.0f) {
+            float speedNmps = ac.groundSpeedKts / 3600.0f;
+            float distNm = speedNmps * dtSeconds;
+            float rad = ac.trackDeg * static_cast<float>(M_PI / 180.0f);
+            ac.eastNm += sinf(rad) * distNm;
+            ac.northNm += cosf(rad) * distNm;
+        }
+    }
+}
