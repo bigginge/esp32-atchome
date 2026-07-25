@@ -18,10 +18,6 @@
 #include "radar_view.hpp"
 #include "info_panel.hpp"
 
-#ifndef MY_LOCATION_NAME
-#define MY_LOCATION_NAME "Home"
-#endif
-
 static constexpr uint16_t kHorRes = 800;
 static constexpr uint16_t kVerRes = 480;
 
@@ -239,7 +235,6 @@ static bool initLvgl() {
   lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 
   infoPanel.create(screen);
-  infoPanel.setLocation(MY_LOCATION_NAME);
   if (!radarView.create(screen, static_cast<float>(SEARCH_RADIUS_NM))) {
     return false;
   }

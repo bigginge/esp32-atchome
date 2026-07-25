@@ -12,7 +12,6 @@
 // Find yours at: https://www.latlong.net/
 #define MY_LATITUDE   51.5074
 #define MY_LONGITUDE  -0.1278
-#define MY_LOCATION_NAME "Home"  // Friendly label shown on the display
 
 // ===== Search / refresh =====
 #define SEARCH_RADIUS_NM       25     // Nautical miles (adsb.fi max 250)

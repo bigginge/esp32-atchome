@@ -4,31 +4,79 @@
 #include <stdio.h>
 #include <string.h>
 
-static lv_obj_t *addField(lv_obj_t *parent, const char *caption, lv_obj_t **valueOut) {
+// The panel is a fixed 320x480 with no scrolling, so every block must have a
+// deterministic height: values are single-line marquees rather than wrapping
+// labels, otherwise a long airport name pushes the route off the bottom.
+static constexpr int32_t kBlockPadBottom = 8;
+
+static lv_obj_t *makeBlock(lv_obj_t *parent) {
   lv_obj_t *block = lv_obj_create(parent);
   lv_obj_set_width(block, LV_PCT(100));
   lv_obj_set_height(block, LV_SIZE_CONTENT);
   lv_obj_set_style_bg_opa(block, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(block, 0, 0);
   lv_obj_set_style_pad_all(block, 0, 0);
-  lv_obj_set_style_pad_bottom(block, 10, 0);
+  lv_obj_set_style_pad_bottom(block, kBlockPadBottom, 0);
   lv_obj_set_flex_flow(block, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(block, 2, 0);
   lv_obj_clear_flag(block, LV_OBJ_FLAG_SCROLLABLE);
+  return block;
+}
 
-  lv_obj_t *captionLabel = lv_label_create(block);
+static lv_obj_t *makeCaption(lv_obj_t *parent, const char *caption) {
+  lv_obj_t *captionLabel = lv_label_create(parent);
   lv_label_set_text(captionLabel, caption);
   lv_obj_set_style_text_color(captionLabel, lv_color_hex(0x7A8A9A), 0);
   lv_obj_set_style_text_font(captionLabel, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_letter_space(captionLabel, 1, 0);
+  return captionLabel;
+}
 
-  lv_obj_t *valueLabel = lv_label_create(block);
+static lv_obj_t *makeValue(lv_obj_t *parent, const lv_font_t *font) {
+  lv_obj_t *valueLabel = lv_label_create(parent);
   lv_label_set_text(valueLabel, "—");
-  lv_label_set_long_mode(valueLabel, LV_LABEL_LONG_WRAP);
+  lv_label_set_long_mode(valueLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
   lv_obj_set_width(valueLabel, LV_PCT(100));
   lv_obj_set_style_text_color(valueLabel, lv_color_hex(0xE8EEF4), 0);
-  lv_obj_set_style_text_font(valueLabel, &lv_font_montserrat_16, 0);
-  *valueOut = valueLabel;
+  lv_obj_set_style_text_font(valueLabel, font, 0);
+  return valueLabel;
+}
+
+static lv_obj_t *addField(lv_obj_t *parent, const char *caption, lv_obj_t **valueOut) {
+  lv_obj_t *block = makeBlock(parent);
+  makeCaption(block, caption);
+  *valueOut = makeValue(block, &lv_font_montserrat_16);
   return block;
+}
+
+/** Row holding the short numeric readouts side by side. */
+static lv_obj_t *addMetricRow(lv_obj_t *parent) {
+  lv_obj_t *row = lv_obj_create(parent);
+  lv_obj_set_width(row, LV_PCT(100));
+  lv_obj_set_height(row, LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(row, 0, 0);
+  lv_obj_set_style_pad_all(row, 0, 0);
+  lv_obj_set_style_pad_bottom(row, kBlockPadBottom, 0);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(row, 8, 0);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  return row;
+}
+
+static void addMetric(lv_obj_t *row, const char *caption, lv_obj_t **valueOut) {
+  lv_obj_t *col = lv_obj_create(row);
+  lv_obj_set_height(col, LV_SIZE_CONTENT);
+  lv_obj_set_flex_grow(col, 1);
+  lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(col, 0, 0);
+  lv_obj_set_style_pad_all(col, 0, 0);
+  lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(col, 2, 0);
+  lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+
+  makeCaption(col, caption);
+  *valueOut = makeValue(col, &lv_font_montserrat_16);
 }
 
 void InfoPanel::create(lv_obj_t *parent) {
@@ -69,20 +117,12 @@ void InfoPanel::create(lv_obj_t *parent) {
   lv_obj_set_style_text_color(dateLabel_, lv_color_hex(0x7A8A9A), 0);
   lv_obj_set_style_text_font(dateLabel_, &lv_font_montserrat_14, 0);
 
-  locationLabel_ = lv_label_create(clockContainer_);
-  lv_label_set_text(locationLabel_, LV_SYMBOL_GPS " —");
-  lv_obj_set_style_text_color(locationLabel_, lv_color_hex(0xA0B0C0), 0);
-  lv_obj_set_style_text_font(locationLabel_, &lv_font_montserrat_14, 0);
-
-  statsLabel_ = lv_label_create(clockContainer_);
-  lv_label_set_text(statsLabel_, "");
-  lv_obj_set_style_text_color(statsLabel_, lv_color_hex(0x7A8A9A), 0);
-  lv_obj_set_style_text_font(statsLabel_, &lv_font_montserrat_14, 0);
-
   statusLabel_ = lv_label_create(panel_);
   lv_label_set_text(statusLabel_, "Connecting...");
   lv_label_set_long_mode(statusLabel_, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(statusLabel_, LV_PCT(100));
+  // Grows so the stats line below stays pinned to the bottom of the panel.
+  lv_obj_set_flex_grow(statusLabel_, 1);
   lv_obj_set_style_text_color(statusLabel_, lv_color_hex(0xA0B0C0), 0);
   lv_obj_set_style_text_font(statusLabel_, &lv_font_montserrat_14, 0);
 
@@ -96,24 +136,32 @@ void InfoPanel::create(lv_obj_t *parent) {
   lv_obj_add_flag(fieldsCont_, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(fieldsCont_, LV_OBJ_FLAG_SCROLLABLE);
 
-  addField(fieldsCont_, "Aircraft", &aircraft_);
-  addField(fieldsCont_, "Flight", &flight_);
-  addField(fieldsCont_, LV_SYMBOL_GPS " Distance", &distance_);
-  addField(fieldsCont_, LV_SYMBOL_UP " Altitude", &altitude_);
-  addField(fieldsCont_, LV_SYMBOL_REFRESH " Speed", &speed_);
-  addField(fieldsCont_, "Origin", &origin_);
-  addField(fieldsCont_, "Destination", &destination_);
+  addField(fieldsCont_, "AIRCRAFT", &aircraft_);
+  addField(fieldsCont_, "FLIGHT", &flight_);
+
+  lv_obj_t *metrics = addMetricRow(fieldsCont_);
+  addMetric(metrics, "DIST", &distance_);
+  addMetric(metrics, "ALT", &altitude_);
+  addMetric(metrics, "SPD", &speed_);
+
+  // Route is one block: the codes headline the leg, the airport names sit
+  // beneath it and marquee when they are too long for the panel.
+  routeBlock_ = makeBlock(fieldsCont_);
+  makeCaption(routeBlock_, "ROUTE");
+  routeCodes_ = makeValue(routeBlock_, &lv_font_montserrat_20);
+  originName_ = makeValue(routeBlock_, &lv_font_montserrat_14);
+  lv_obj_set_style_text_color(originName_, lv_color_hex(0xA0B0C0), 0);
+  destName_ = makeValue(routeBlock_, &lv_font_montserrat_14);
+  lv_obj_set_style_text_color(destName_, lv_color_hex(0xA0B0C0), 0);
 
   // Promote the primary aircraft line for a clearer hierarchy.
   lv_obj_set_style_text_font(aircraft_, &lv_font_montserrat_20, 0);
-}
 
-void InfoPanel::setLocation(const char *name) {
-  if (locationLabel_ == nullptr) return;
-  char buf[64];
-  snprintf(buf, sizeof(buf), LV_SYMBOL_GPS " %s",
-           (name != nullptr && name[0] != '\0') ? name : "Home");
-  lv_label_set_text(locationLabel_, buf);
+  // Last child of the panel: the growing body above pushes it to the bottom.
+  statsLabel_ = lv_label_create(panel_);
+  lv_label_set_text(statsLabel_, "");
+  lv_obj_set_style_text_color(statsLabel_, lv_color_hex(0x7A8A9A), 0);
+  lv_obj_set_style_text_font(statsLabel_, &lv_font_montserrat_14, 0);
 }
 
 void InfoPanel::setStats(size_t inRange, long secondsSinceUpdate) {
@@ -157,6 +205,18 @@ void InfoPanel::setField(lv_obj_t *valueLabel, const char *value) {
   } else {
     lv_label_set_text(valueLabel, value);
     lv_obj_clear_flag(block, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+void InfoPanel::setLabelText(lv_obj_t *label, const char *value) {
+  if (label == nullptr) {
+    return;
+  }
+  if (value == nullptr || value[0] == '\0') {
+    lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_label_set_text(label, value);
+    lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
   }
 }
 
@@ -228,29 +288,23 @@ void InfoPanel::showAircraft(const Aircraft *aircraft) {
     setField(speed_, "");
   }
 
-  buf = "";
-  if (aircraft->origin[0]) buf += aircraft->origin;
-  if (aircraft->originIcao[0]) {
-    if (buf.length() > 0 && strcmp(aircraft->origin, aircraft->originIcao) != 0) {
-      buf += " (";
-      buf += aircraft->originIcao;
-      buf += ")";
-    } else if (buf.length() == 0) {
-      buf += aircraft->originIcao;
-    }
+  if (aircraft->originIcao[0] == '\0' && aircraft->destinationIcao[0] == '\0') {
+    lv_obj_add_flag(routeBlock_, LV_OBJ_FLAG_HIDDEN);
+    return;
   }
-  setField(origin_, buf.c_str());
+  lv_obj_clear_flag(routeBlock_, LV_OBJ_FLAG_HIDDEN);
 
-  buf = "";
-  if (aircraft->destination[0]) buf += aircraft->destination;
-  if (aircraft->destinationIcao[0]) {
-    if (buf.length() > 0 && strcmp(aircraft->destination, aircraft->destinationIcao) != 0) {
-      buf += " (";
-      buf += aircraft->destinationIcao;
-      buf += ")";
-    } else if (buf.length() == 0) {
-      buf += aircraft->destinationIcao;
-    }
-  }
-  setField(destination_, buf.c_str());
+  // ASCII only: the built-in montserrat fonts carry 0x20-0x7F plus the LV_SYMBOL
+  // glyphs, so an em dash here would render as a missing-glyph box.
+  buf = aircraft->originIcao[0] ? aircraft->originIcao : "???";
+  buf += " " LV_SYMBOL_RIGHT " ";
+  buf += aircraft->destinationIcao[0] ? aircraft->destinationIcao : "???";
+  lv_label_set_text(routeCodes_, buf.c_str());
+
+  // Until the airport-name lookups land, origin/destination still hold the raw
+  // ICAO codes (see fetchRouteInfo) — don't repeat them under the codes line.
+  const bool haveOriginName = strcmp(aircraft->origin, aircraft->originIcao) != 0;
+  const bool haveDestName = strcmp(aircraft->destination, aircraft->destinationIcao) != 0;
+  setLabelText(originName_, haveOriginName ? aircraft->origin : "");
+  setLabelText(destName_, haveDestName ? aircraft->destination : "");
 }
