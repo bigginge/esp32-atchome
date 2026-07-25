@@ -4,8 +4,13 @@
 /* CrowPanel 7" RGB565 panel */
 #define LV_COLOR_DEPTH 16
 
-#define LV_USE_STDLIB_MALLOC LV_STDLIB_BUILTIN
-#define LV_MEM_SIZE (128 * 1024U)
+// LVGL allocations are routed to PSRAM via custom core allocators
+// (src/lv_psram_alloc.cpp). This frees ~128 KB of internal SRAM (the old
+// builtin static pool) for the WiFi/TLS stack — HTTPS fetches were failing
+// from internal-heap exhaustion.
+#define LV_USE_STDLIB_MALLOC LV_STDLIB_CUSTOM
+// LV_MEM_SIZE is unused with the custom allocator (kept only for reference).
+#define LV_MEM_SIZE (48 * 1024U)
 
 #define LV_DEF_REFR_PERIOD 16
 #define LV_DPI_DEF 130

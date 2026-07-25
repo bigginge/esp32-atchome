@@ -28,6 +28,11 @@ class Tracker {
   bool hasSelection() const { return selectedHex_[0] != '\0'; }
   void updatePositions(float dtSeconds);
 
+  /** Copy enrichment fields (details/route) from `src` onto the tracked
+   *  aircraft with the same hex. Positions and trails are left untouched.
+   *  Returns false if no matching aircraft remains in range. */
+  bool applyEnrichment(const Aircraft &src);
+
  private:
   Aircraft *findByHex(const char *hex);
   const Aircraft *findByHex(const char *hex) const;

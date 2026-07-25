@@ -147,7 +147,6 @@ bool fetchNearbyAircraft(float homeLat, float homeLon, int radiusNm,
       dst.trackDeg = static_cast<float>(ac["track"].as<int>());
     }
 
-    dst.hue = hueFromHex(dst.hex);
     dst.seen = true;
     ++count;
   }

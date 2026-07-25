@@ -75,7 +75,6 @@ void Tracker::retainEnrichment(Aircraft &dst, const Aircraft &prev) {
   memcpy(dst.trail, prev.trail, sizeof(dst.trail));
   dst.trailCount = prev.trailCount;
   dst.trailHead = prev.trailHead;
-  dst.hue = prev.hue != 0 ? prev.hue : hueFromHex(dst.hex);
 }
 
 void Tracker::mergeSnapshot(const Aircraft *incoming, size_t count) {
@@ -104,7 +103,6 @@ void Tracker::mergeSnapshot(const Aircraft *incoming, size_t count) {
       retainEnrichment(dst, *prev);
       pushTrail(dst, dst.eastNm, dst.northNm);
     } else {
-      dst.hue = hueFromHex(dst.hex);
       dst.trailCount = 0;
       dst.trailHead = 0;
       pushTrail(dst, dst.eastNm, dst.northNm);
@@ -180,6 +178,27 @@ Aircraft *Tracker::selectNearestTo(float eastNm, float northNm, float hitRadiusN
     selectNearest();
   }
   return best;
+}
+
+bool Tracker::applyEnrichment(const Aircraft &src) {
+  Aircraft *dst = findByHex(src.hex);
+  if (dst == nullptr) {
+    return false;
+  }
+  memcpy(dst->manufacturer, src.manufacturer, sizeof(dst->manufacturer));
+  memcpy(dst->typeDescription, src.typeDescription, sizeof(dst->typeDescription));
+  memcpy(dst->registeredOwner, src.registeredOwner, sizeof(dst->registeredOwner));
+  if (dst->registration[0] == '\0') {
+    memcpy(dst->registration, src.registration, sizeof(dst->registration));
+  }
+  memcpy(dst->origin, src.origin, sizeof(dst->origin));
+  memcpy(dst->destination, src.destination, sizeof(dst->destination));
+  memcpy(dst->originIcao, src.originIcao, sizeof(dst->originIcao));
+  memcpy(dst->destinationIcao, src.destinationIcao, sizeof(dst->destinationIcao));
+  dst->detailsLoaded = src.detailsLoaded;
+  dst->routeLoaded = src.routeLoaded;
+  dst->routeLookupStep = src.routeLookupStep;
+  return true;
 }
 
 void Tracker::updatePositions(float dtSeconds) {

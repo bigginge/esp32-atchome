@@ -43,7 +43,6 @@ struct Aircraft {
   // 0: fetch route, 1: fetch origin, 2: fetch destination, 3: complete.
   uint8_t routeLookupStep;
 
-  uint8_t hue;
   TrailPoint trail[kTrailLen];
   uint8_t trailCount;
   uint8_t trailHead;
@@ -56,14 +55,4 @@ inline float altitudeNorm(int altitudeFt) {
   if (altitudeFt <= 0) return 0.0f;
   if (altitudeFt >= kMaxAltitudeFt) return 1.0f;
   return static_cast<float>(altitudeFt) / static_cast<float>(kMaxAltitudeFt);
-}
-
-/** Stable hue 0..255 from ICAO hex. */
-inline uint8_t hueFromHex(const char *hex) {
-  uint32_t hash = 2166136261u;
-  for (const char *p = hex; p && *p; ++p) {
-    hash ^= static_cast<uint8_t>(*p);
-    hash *= 16777619u;
-  }
-  return static_cast<uint8_t>(hash & 0xFFu);
 }

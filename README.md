@@ -18,10 +18,11 @@ Live ADS-B traffic on a square radar (left) with an aircraft detail panel (right
 
 ## Features
 
-- **Radar** (480×480): concentric range rings centred on your location; aircraft symbols oriented by track with altitude-aware colour and trails (lower altitude = more distinct trails)
-- **Info panel** (320×480): manufacturer, type, registration, flight number, distance (nm), origin and destination airports
+- **Radar** (480×480): concentric range rings (labelled in nm) and N/E/S/W compass markers centred on your location; plane-shaped aircraft symbols oriented by track, coloured by altitude (green-cyan low → magenta high) with an altitude legend, per-aircraft callsign + flight-level labels, and trails (lower altitude = more distinct trails)
+- **Info panel** (320×480): live clock, your location, aircraft-in-range count and data-freshness ("updated Ns ago"); for the selection: manufacturer, type, registration, flight number, distance (nm), altitude, ground speed, and origin/destination airports
+- **Responsive UI**: all network requests run on the ESP32-S3's second core, so the radar animates smoothly and touch stays responsive while data is fetched
 - **Touch select**: tap an aircraft to highlight it and load details; selection clears when it leaves range; defaults to the nearest aircraft
-- **Data**: [adsb.fi](https://adsb.fi/) positions; [hexdb.io](https://hexdb.io/) aircraft and route enrichment (lazy, for the selection)
+- **Data**: [adsb.fi](https://adsb.fi/) positions (polled every 5 s); [hexdb.io](https://hexdb.io/) aircraft and route enrichment (lazy, for the selection)
 
 ## Prerequisites
 
@@ -30,8 +31,12 @@ Live ADS-B traffic on a square radar (left) with an aircraft detail panel (right
 - Libraries:
 
 ```bash
-arduino-cli lib install "lvgl" "LovyanGFX" "PCA9557-arduino" "ArduinoJson"
+arduino-cli lib install "lvgl" "PCA9557-arduino" "ArduinoJson"
 ```
+
+The display uses the ESP-IDF `esp_lcd` RGB driver (bundled with the ESP32 core) with two PSRAM
+framebuffers and VSYNC page-flip for tear-free output; touch is a small built-in GT911 reader. No
+external graphics library is required.
 
 Board index (see `arduino-cli.yaml`):
 
@@ -43,7 +48,7 @@ Board index (see `arduino-cli.yaml`):
 cp config.example.h config.h
 ```
 
-Edit `config.h`: WiFi SSID/password, latitude/longitude, search radius, refresh interval.  
+Edit `config.h`: WiFi SSID/password, latitude/longitude, a friendly location name, search radius, refresh interval.  
 `config.h` is gitignored.
 
 ## Build / upload

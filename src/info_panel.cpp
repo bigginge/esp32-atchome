@@ -69,6 +69,16 @@ void InfoPanel::create(lv_obj_t *parent) {
   lv_obj_set_style_text_color(dateLabel_, lv_color_hex(0x7A8A9A), 0);
   lv_obj_set_style_text_font(dateLabel_, &lv_font_montserrat_14, 0);
 
+  locationLabel_ = lv_label_create(clockContainer_);
+  lv_label_set_text(locationLabel_, LV_SYMBOL_GPS " —");
+  lv_obj_set_style_text_color(locationLabel_, lv_color_hex(0xA0B0C0), 0);
+  lv_obj_set_style_text_font(locationLabel_, &lv_font_montserrat_14, 0);
+
+  statsLabel_ = lv_label_create(clockContainer_);
+  lv_label_set_text(statsLabel_, "");
+  lv_obj_set_style_text_color(statsLabel_, lv_color_hex(0x7A8A9A), 0);
+  lv_obj_set_style_text_font(statsLabel_, &lv_font_montserrat_14, 0);
+
   statusLabel_ = lv_label_create(panel_);
   lv_label_set_text(statusLabel_, "Connecting...");
   lv_label_set_long_mode(statusLabel_, LV_LABEL_LONG_WRAP);
@@ -88,17 +98,43 @@ void InfoPanel::create(lv_obj_t *parent) {
 
   addField(fieldsCont_, "Aircraft", &aircraft_);
   addField(fieldsCont_, "Flight", &flight_);
-  addField(fieldsCont_, "Distance", &distance_);
+  addField(fieldsCont_, LV_SYMBOL_GPS " Distance", &distance_);
+  addField(fieldsCont_, LV_SYMBOL_UP " Altitude", &altitude_);
+  addField(fieldsCont_, LV_SYMBOL_REFRESH " Speed", &speed_);
   addField(fieldsCont_, "Origin", &origin_);
   addField(fieldsCont_, "Destination", &destination_);
-  addField(fieldsCont_, "Altitude", &altitude_);
+
+  // Promote the primary aircraft line for a clearer hierarchy.
+  lv_obj_set_style_text_font(aircraft_, &lv_font_montserrat_20, 0);
+}
+
+void InfoPanel::setLocation(const char *name) {
+  if (locationLabel_ == nullptr) return;
+  char buf[64];
+  snprintf(buf, sizeof(buf), LV_SYMBOL_GPS " %s",
+           (name != nullptr && name[0] != '\0') ? name : "Home");
+  lv_label_set_text(locationLabel_, buf);
+}
+
+void InfoPanel::setStats(size_t inRange, long secondsSinceUpdate) {
+  if (statsLabel_ == nullptr) return;
+  char buf[48];
+  if (secondsSinceUpdate < 0) {
+    snprintf(buf, sizeof(buf), "%u in range", static_cast<unsigned>(inRange));
+  } else {
+    snprintf(buf, sizeof(buf), "%u in range " LV_SYMBOL_BULLET " updated %lds ago",
+             static_cast<unsigned>(inRange), secondsSinceUpdate);
+  }
+  lv_label_set_text(statsLabel_, buf);
 }
 
 void InfoPanel::updateClock() {
   if (timeLabel_ == nullptr || dateLabel_ == nullptr) return;
 
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo, 2000)) {
+  // Non-blocking: never stall the UI waiting for NTP. Once time is set this
+  // returns immediately; before sync it simply leaves the placeholder text.
+  if (!getLocalTime(&timeinfo, 5)) {
     return;
   }
   char buf[9];
@@ -180,6 +216,18 @@ void InfoPanel::showAircraft(const Aircraft *aircraft) {
   snprintf(distBuf, sizeof(distBuf), "%.1f nm", aircraft->distanceNm);
   setField(distance_, distBuf);
 
+  char altBuf[32];
+  snprintf(altBuf, sizeof(altBuf), "%d ft", aircraft->altitudeFt);
+  setField(altitude_, altBuf);
+
+  if (aircraft->groundSpeedKts > 0.0f) {
+    char spdBuf[32];
+    snprintf(spdBuf, sizeof(spdBuf), "%.0f kt", aircraft->groundSpeedKts);
+    setField(speed_, spdBuf);
+  } else {
+    setField(speed_, "");
+  }
+
   buf = "";
   if (aircraft->origin[0]) buf += aircraft->origin;
   if (aircraft->originIcao[0]) {
@@ -205,8 +253,4 @@ void InfoPanel::showAircraft(const Aircraft *aircraft) {
     }
   }
   setField(destination_, buf.c_str());
-
-  char altBuf[32];
-  snprintf(altBuf, sizeof(altBuf), "%d ft", aircraft->altitudeFt);
-  setField(altitude_, altBuf);
 }

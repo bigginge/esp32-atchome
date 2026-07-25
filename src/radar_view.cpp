@@ -2,10 +2,45 @@
 
 #include <esp_heap_caps.h>
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
-bool RadarView::create(lv_obj_t *parent, Tracker *tracker, float rangeNm) {
-  tracker_ = tracker;
+namespace {
+
+constexpr uint32_t kBgColor = 0x0B1218;
+
+// Draw a text label straight onto the canvas layer. LVGL only duplicates the
+// text when text_local is set, so we set it and let LVGL copy — that keeps a
+// caller-side stack buffer safe to reuse for the next label.
+void drawText(lv_layer_t *layer, int32_t x, int32_t y, int32_t w,
+              const char *text, lv_color_t color, lv_opa_t opa,
+              const lv_font_t *font, lv_text_align_t align) {
+  lv_draw_label_dsc_t dsc;
+  lv_draw_label_dsc_init(&dsc);
+  dsc.color = color;
+  dsc.opa = opa;
+  dsc.font = font;
+  dsc.text = text;
+  dsc.text_local = 1;
+  dsc.text_length = strlen(text);
+  dsc.align = align;
+  lv_area_t area = {x, y, x + w, y + static_cast<int32_t>(font->line_height) + 2};
+  lv_draw_label(layer, &dsc, &area);
+}
+
+}  // namespace
+
+lv_color_t altitudeColor(int altitudeFt) {
+  if (altitudeFt <= 0) {
+    return lv_color_hex(0x8A9AAA);  // ground / unknown
+  }
+  const float n = altitudeNorm(altitudeFt);
+  // Monotonic hue sweep, green-cyan (low) → magenta (high).
+  const uint16_t hue = static_cast<uint16_t>(lroundf(150.0f + n * 170.0f));
+  return lv_color_hsv_to_rgb(hue, 82, 98);
+}
+
+bool RadarView::create(lv_obj_t *parent, float rangeNm) {
   setRangeNm(rangeNm);
 
   const size_t bufBytes =
@@ -33,6 +68,28 @@ void RadarView::setRangeNm(float rangeNm) {
   pxPerNm_ = static_cast<float>(kSize / 2 - 8) / rangeNm_;
 }
 
+void RadarView::setSnapshot(const Aircraft *list, size_t count,
+                            const char *selectedHex) {
+  snap_ = list;
+  snapCount_ = count;
+  if (selectedHex != nullptr) {
+    strncpy(selectedHex_, selectedHex, sizeof(selectedHex_) - 1);
+    selectedHex_[sizeof(selectedHex_) - 1] = '\0';
+  } else {
+    selectedHex_[0] = '\0';
+  }
+}
+
+bool RadarView::consumePendingClick(float *eastNm, float *northNm) {
+  if (!pendingClick_) {
+    return false;
+  }
+  pendingClick_ = false;
+  if (eastNm != nullptr) *eastNm = pendingEast_;
+  if (northNm != nullptr) *northNm = pendingNorth_;
+  return true;
+}
+
 void RadarView::nmToPixel(float eastNm, float northNm, int32_t *x, int32_t *y) const {
   *x = static_cast<int32_t>(lroundf(kSize * 0.5f + eastNm * pxPerNm_));
   *y = static_cast<int32_t>(lroundf(kSize * 0.5f - northNm * pxPerNm_));
@@ -44,11 +101,7 @@ void RadarView::pixelToNm(int32_t x, int32_t y, float *eastNm, float *northNm) c
 }
 
 lv_color_t RadarView::colorForAircraft(const Aircraft &ac) const {
-  const float n = altitudeNorm(ac.altitudeFt);
-  // Low altitude → darker; high altitude → lighter. HSV s/v are 0..100.
-  const uint8_t v = static_cast<uint8_t>(lroundf(28.0f + n * 72.0f));
-  const uint8_t s = static_cast<uint8_t>(lroundf(92.0f - n * 28.0f));
-  return lv_color_hsv_to_rgb(static_cast<uint16_t>(ac.hue) * 360u / 255u, s, v);
+  return altitudeColor(ac.altitudeFt);
 }
 
 lv_opa_t RadarView::trailOpacity(const Aircraft &ac, uint8_t ageIndex,
@@ -66,7 +119,9 @@ void RadarView::drawBackground(lv_layer_t *layer) {
   const int32_t cx = kSize / 2;
   const int32_t cy = kSize / 2;
   const lv_color_t ringColor = lv_color_hex(0x2A3A4A);
-  const lv_color_t crossColor = lv_color_hex(0x3A4A5A);
+  const lv_color_t crossColor = lv_color_hex(0x1E2A36);
+  const lv_color_t labelColor = lv_color_hex(0x5A6A7A);
+  const lv_color_t compassColor = lv_color_hex(0x8A9AAA);
 
   lv_draw_line_dsc_t line;
   lv_draw_line_dsc_init(&line);
@@ -97,13 +152,30 @@ void RadarView::drawBackground(lv_layer_t *layer) {
   const int rings = 4;
   for (int i = 1; i <= rings; ++i) {
     const float nm = rangeNm_ * (static_cast<float>(i) / static_cast<float>(rings));
+    const int32_t radius = static_cast<int32_t>(lroundf(nm * pxPerNm_));
     arc.center.x = cx;
     arc.center.y = cy;
-    arc.radius = static_cast<int16_t>(lroundf(nm * pxPerNm_));
+    arc.radius = static_cast<int16_t>(radius);
     lv_draw_arc(layer, &arc);
+
+    // Ring range label, just above the ring on the vertical axis.
+    char nmBuf[8];
+    snprintf(nmBuf, sizeof(nmBuf), "%d", static_cast<int>(lroundf(nm)));
+    drawText(layer, cx + 5, cy - radius - 1, 40, nmBuf, labelColor, LV_OPA_COVER,
+             &lv_font_montserrat_14, LV_TEXT_ALIGN_LEFT);
   }
 
-  // Home marker
+  // Compass markers.
+  drawText(layer, cx - 16, 3, 32, "N", compassColor, LV_OPA_COVER,
+           &lv_font_montserrat_16, LV_TEXT_ALIGN_CENTER);
+  drawText(layer, cx - 16, kSize - 22, 32, "S", compassColor, LV_OPA_COVER,
+           &lv_font_montserrat_16, LV_TEXT_ALIGN_CENTER);
+  drawText(layer, kSize - 22, cy - 10, 20, "E", compassColor, LV_OPA_COVER,
+           &lv_font_montserrat_16, LV_TEXT_ALIGN_CENTER);
+  drawText(layer, 2, cy - 10, 20, "W", compassColor, LV_OPA_COVER,
+           &lv_font_montserrat_16, LV_TEXT_ALIGN_CENTER);
+
+  // Home marker + label.
   lv_draw_rect_dsc_t home;
   lv_draw_rect_dsc_init(&home);
   home.bg_color = lv_color_hex(0xC8D0D8);
@@ -111,6 +183,8 @@ void RadarView::drawBackground(lv_layer_t *layer) {
   home.radius = LV_RADIUS_CIRCLE;
   lv_area_t homeArea = {cx - 3, cy - 3, cx + 3, cy + 3};
   lv_draw_rect(layer, &home, &homeArea);
+  drawText(layer, cx - 24, cy + 6, 48, "HOME", lv_color_hex(0x9AAAB8),
+           LV_OPA_COVER, &lv_font_montserrat_14, LV_TEXT_ALIGN_CENTER);
 }
 
 void RadarView::drawAircraft(lv_layer_t *layer, const Aircraft &ac, bool selected) {
@@ -130,10 +204,7 @@ void RadarView::drawAircraft(lv_layer_t *layer, const Aircraft &ac, bool selecte
           static_cast<uint8_t>((ac.trailHead + kTrailLen - ac.trailCount + i) % kTrailLen);
       const uint8_t idx1 =
           static_cast<uint8_t>((ac.trailHead + kTrailLen - ac.trailCount + i + 1) % kTrailLen);
-      int32_t x0 = 0;
-      int32_t y0 = 0;
-      int32_t x1 = 0;
-      int32_t y1 = 0;
+      int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
       nmToPixel(ac.trail[idx0].eastNm, ac.trail[idx0].northNm, &x0, &y0);
       nmToPixel(ac.trail[idx1].eastNm, ac.trail[idx1].northNm, &x1, &y1);
       trail.opa = trailOpacity(ac, i, ac.trailCount);
@@ -145,23 +216,14 @@ void RadarView::drawAircraft(lv_layer_t *layer, const Aircraft &ac, bool selecte
     }
   }
 
-  int32_t x = 0;
-  int32_t y = 0;
+  int32_t x = 0, y = 0;
   nmToPixel(ac.eastNm, ac.northNm, &x, &y);
 
   const float rad = (ac.trackDeg - 90.0f) * static_cast<float>(DEG_TO_RAD);
-  const float c = cosf(rad);
-  const float s = sinf(rad);
-  const float len = selected ? 11.0f : 9.0f;
-  const float half = selected ? 6.0f : 5.0f;
-
-  // Nose, left wing, right wing in screen space (track 0° = north / up).
-  const float noseX = x + c * len;
-  const float noseY = y + s * len;
-  const float leftX = x - c * (len * 0.45f) - s * half;
-  const float leftY = y - s * (len * 0.45f) + c * half;
-  const float rightX = x - c * (len * 0.45f) + s * half;
-  const float rightY = y - s * (len * 0.45f) - c * half;
+  const float fx = cosf(rad);
+  const float fy = sinf(rad);
+  const float sx = -fy;  // perpendicular (right wing) direction
+  const float sy = fx;
 
   if (selected) {
     lv_draw_arc_dsc_t halo;
@@ -171,49 +233,131 @@ void RadarView::drawAircraft(lv_layer_t *layer, const Aircraft &ac, bool selecte
     halo.opa = LV_OPA_80;
     halo.center.x = x;
     halo.center.y = y;
-    halo.radius = 14;
+    halo.radius = 15;
     halo.start_angle = 0;
     halo.end_angle = 360;
     lv_draw_arc(layer, &halo);
   }
 
-  lv_draw_triangle_dsc_t tri;
-  lv_draw_triangle_dsc_init(&tri);
-  tri.color = color;
-  tri.opa = LV_OPA_COVER;
-  tri.p[0].x = noseX;
-  tri.p[0].y = noseY;
-  tri.p[1].x = leftX;
-  tri.p[1].y = leftY;
-  tri.p[2].x = rightX;
-  tri.p[2].y = rightY;
-  lv_draw_triangle(layer, &tri);
+  // Aircraft glyph: fuselage + wings + tailplane as rounded lines.
+  const float s = selected ? 1.35f : 1.0f;
+  const float noseLen = 9.0f * s;
+  const float tailLen = 6.0f * s;
+  const float wingSpan = 7.5f * s;
+  const float wingAt = 0.5f * s;
+  const float tailSpan = 3.5f * s;
+  const float tailAt = -5.0f * s;
+
+  lv_draw_line_dsc_t glyph;
+  lv_draw_line_dsc_init(&glyph);
+  glyph.color = color;
+  glyph.opa = LV_OPA_COVER;
+  glyph.width = selected ? 3 : 2;
+  glyph.round_start = 1;
+  glyph.round_end = 1;
+
+  auto drawSeg = [&](float ax, float ay, float bx, float by) {
+    glyph.p1.x = static_cast<int32_t>(lroundf(ax));
+    glyph.p1.y = static_cast<int32_t>(lroundf(ay));
+    glyph.p2.x = static_cast<int32_t>(lroundf(bx));
+    glyph.p2.y = static_cast<int32_t>(lroundf(by));
+    lv_draw_line(layer, &glyph);
+  };
+
+  // Fuselage
+  drawSeg(x - fx * tailLen, y - fy * tailLen, x + fx * noseLen, y + fy * noseLen);
+  // Wings
+  drawSeg(x + fx * wingAt + sx * wingSpan, y + fy * wingAt + sy * wingSpan,
+          x + fx * wingAt - sx * wingSpan, y + fy * wingAt - sy * wingSpan);
+  // Tailplane
+  drawSeg(x + fx * tailAt + sx * tailSpan, y + fy * tailAt + sy * tailSpan,
+          x + fx * tailAt - sx * tailSpan, y + fy * tailAt - sy * tailSpan);
+
+  // Label: callsign (or hex) + flight level.
+  char lbl[24];
+  const char *id = ac.callsign[0] != '\0' ? ac.callsign : ac.hex;
+  if (ac.altitudeFt > 0) {
+    snprintf(lbl, sizeof(lbl), "%s %d", id, (ac.altitudeFt + 50) / 100);
+  } else {
+    snprintf(lbl, sizeof(lbl), "%s", id);
+  }
+  drawText(layer, x + 11, y - 8, 100, lbl,
+           selected ? lv_color_hex(0xFFFFFF) : lv_color_hex(0xB8C4D0),
+           selected ? LV_OPA_COVER : LV_OPA_80, &lv_font_montserrat_14,
+           LV_TEXT_ALIGN_LEFT);
+}
+
+void RadarView::drawLegend(lv_layer_t *layer) {
+  const int32_t x0 = kSize - 16;
+  const int32_t barW = 8;
+  const int32_t yTop = 46;
+  const int32_t yBot = 206;
+  const int32_t height = yBot - yTop;
+
+  // Backdrop for legibility.
+  lv_draw_rect_dsc_t back;
+  lv_draw_rect_dsc_init(&back);
+  back.bg_color = lv_color_hex(kBgColor);
+  back.bg_opa = 190;
+  back.radius = 4;
+  lv_area_t backArea = {kSize - 48, yTop - 20, kSize - 2, yBot + 6};
+  lv_draw_rect(layer, &back, &backArea);
+
+  drawText(layer, kSize - 48, yTop - 19, 46, "kft", lv_color_hex(0x7A8A9A),
+           LV_OPA_COVER, &lv_font_montserrat_14, LV_TEXT_ALIGN_CENTER);
+
+  // Gradient bar (top = highest altitude).
+  const int segs = 40;
+  lv_draw_rect_dsc_t seg;
+  lv_draw_rect_dsc_init(&seg);
+  seg.bg_opa = LV_OPA_COVER;
+  for (int i = 0; i < segs; ++i) {
+    const float t = 1.0f - (static_cast<float>(i) + 0.5f) / static_cast<float>(segs);
+    seg.bg_color = altitudeColor(static_cast<int>(t * kMaxAltitudeFt));
+    const int32_t y1 = yTop + i * height / segs;
+    const int32_t y2 = yTop + (i + 1) * height / segs;
+    lv_area_t segArea = {x0, y1, x0 + barW, y2};
+    lv_draw_rect(layer, &seg, &segArea);
+  }
+
+  // Tick labels: 0,10,20,30,40 kft.
+  for (int k = 0; k <= 40; k += 10) {
+    const float frac = static_cast<float>(k * 1000) / static_cast<float>(kMaxAltitudeFt);
+    const int32_t y = yBot - static_cast<int32_t>(lroundf(frac * height)) - 8;
+    char t[4];
+    snprintf(t, sizeof(t), "%d", k);
+    drawText(layer, kSize - 46, y, 26, t, lv_color_hex(0x9AAAB8), LV_OPA_COVER,
+             &lv_font_montserrat_14, LV_TEXT_ALIGN_RIGHT);
+  }
 }
 
 void RadarView::redraw() {
-  if (canvas_ == nullptr || tracker_ == nullptr) {
+  if (canvas_ == nullptr) {
     return;
   }
 
-  lv_canvas_fill_bg(canvas_, lv_color_hex(0x0B1218), LV_OPA_COVER);
+  lv_canvas_fill_bg(canvas_, lv_color_hex(kBgColor), LV_OPA_COVER);
 
   lv_layer_t layer;
   lv_canvas_init_layer(canvas_, &layer);
 
   drawBackground(&layer);
 
-  const Aircraft *selected = tracker_->selected();
-  for (size_t i = 0; i < tracker_->count(); ++i) {
-    const Aircraft &ac = tracker_->aircraft()[i];
-    const bool isSelected =
-        selected != nullptr && strcasecmp(selected->hex, ac.hex) == 0;
-    if (!isSelected) {
-      drawAircraft(&layer, ac, false);
+  const bool hasSelection = selectedHex_[0] != '\0';
+  const Aircraft *selected = nullptr;
+  for (size_t i = 0; i < snapCount_; ++i) {
+    const Aircraft &ac = snap_[i];
+    if (hasSelection && strcasecmp(selectedHex_, ac.hex) == 0) {
+      selected = &ac;
+      continue;
     }
+    drawAircraft(&layer, ac, false);
   }
   if (selected != nullptr) {
     drawAircraft(&layer, *selected, true);
   }
+
+  drawLegend(&layer);
 
   lv_canvas_finish_layer(canvas_, &layer);
 }
@@ -224,7 +368,7 @@ void RadarView::onClicked(lv_event_t *e) {
   }
 
   auto *self = static_cast<RadarView *>(lv_event_get_user_data(e));
-  if (self == nullptr || self->tracker_ == nullptr || self->canvas_ == nullptr) {
+  if (self == nullptr || self->canvas_ == nullptr) {
     return;
   }
 
@@ -241,12 +385,6 @@ void RadarView::onClicked(lv_event_t *e) {
   const int32_t localX = point.x - coords.x1;
   const int32_t localY = point.y - coords.y1;
 
-  float eastNm = 0.0f;
-  float northNm = 0.0f;
-  self->pixelToNm(localX, localY, &eastNm, &northNm);
-
-  const float hitNm = 3.0f;
-  if (self->tracker_->selectNearestTo(eastNm, northNm, hitNm) != nullptr) {
-    self->redraw();
-  }
+  self->pixelToNm(localX, localY, &self->pendingEast_, &self->pendingNorth_);
+  self->pendingClick_ = true;
 }

@@ -10,6 +10,8 @@ class InfoPanel {
   static constexpr int32_t kHeight = 480;
 
   void create(lv_obj_t *parent);
+  void setLocation(const char *name);
+  void setStats(size_t inRange, long secondsSinceUpdate);
   void showAircraft(const Aircraft *aircraft);
   void showStatus(const char *status);
   void updateClock();
@@ -21,12 +23,15 @@ class InfoPanel {
   lv_obj_t *clockContainer_ = nullptr;
   lv_obj_t *timeLabel_ = nullptr;
   lv_obj_t *dateLabel_ = nullptr;
+  lv_obj_t *locationLabel_ = nullptr;
+  lv_obj_t *statsLabel_ = nullptr;
   lv_obj_t *statusLabel_ = nullptr;
   lv_obj_t *aircraft_ = nullptr;
   lv_obj_t *flight_ = nullptr;
   lv_obj_t *distance_ = nullptr;
+  lv_obj_t *altitude_ = nullptr;
+  lv_obj_t *speed_ = nullptr;
   lv_obj_t *origin_ = nullptr;
   lv_obj_t *destination_ = nullptr;
-  lv_obj_t *altitude_ = nullptr;
   lv_obj_t *fieldsCont_ = nullptr;
 };
