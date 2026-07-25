@@ -27,5 +27,6 @@ class InfoPanel {
   lv_obj_t *distance_ = nullptr;
   lv_obj_t *origin_ = nullptr;
   lv_obj_t *destination_ = nullptr;
+  lv_obj_t *altitude_ = nullptr;
   lv_obj_t *fieldsCont_ = nullptr;
 };

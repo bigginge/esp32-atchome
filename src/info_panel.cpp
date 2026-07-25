@@ -91,6 +91,7 @@ void InfoPanel::create(lv_obj_t *parent) {
   addField(fieldsCont_, "Distance", &distance_);
   addField(fieldsCont_, "Origin", &origin_);
   addField(fieldsCont_, "Destination", &destination_);
+  addField(fieldsCont_, "Altitude", &altitude_);
 }
 
 void InfoPanel::updateClock() {
@@ -204,4 +205,8 @@ void InfoPanel::showAircraft(const Aircraft *aircraft) {
     }
   }
   setField(destination_, buf.c_str());
+
+  char altBuf[32];
+  snprintf(altBuf, sizeof(altBuf), "%d ft", aircraft->altitudeFt);
+  setField(altitude_, altBuf);
 }
