@@ -3,6 +3,7 @@
 #include <Wire.h>
 #include <lvgl.h>
 #include <PCA9557.h>
+#include <time.h>
 #include <esp_heap_caps.h>
 
 #include "config.h"
@@ -34,6 +35,7 @@ static unsigned long lastEnrichmentAttemptMs = 0;
 static bool lastEnrichmentAttemptFailed = false;
 static bool fetchInProgress = false;
 static unsigned long lastPosUpdateMs = 0;
+static unsigned long lastClockMs = 0;
 
 static constexpr unsigned long kEnrichmentSuccessIntervalMs = 1200;
 static constexpr unsigned long kEnrichmentRetryIntervalMs = 5000;
@@ -191,6 +193,7 @@ static void connectWiFi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("[WiFi] Connected %s\n", WiFi.localIP().toString().c_str());
+    configTzTime("GMT0BST,M3.5.0,M10.5.0", "pool.ntp.org");
   } else {
     Serial.println("[WiFi] Connection failed");
     infoPanel.showStatus("WiFi failed");
@@ -281,6 +284,11 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED) {
       fetchAndUpdate();
     }
+  }
+
+  if (now - lastClockMs >= 1000) {
+    lastClockMs = now;
+    infoPanel.updateClock();
   }
 
   now = millis();

@@ -1,7 +1,7 @@
 .PHONY: compile upload verify clean help all
 
 FQBN = esp32:esp32:esp32s3:PSRAM=opi,FlashMode=qio,FlashSize=4M,PartitionScheme=huge_app,CDCOnBoot=cdc,USBMode=hwcdc
-PORT ?= COM3
+PORT ?= COM4
 BAUD = 921600
 SKETCH_DIR := $(CURDIR)
 

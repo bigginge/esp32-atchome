@@ -138,7 +138,7 @@ bool fetchNearbyAircraft(float homeLat, float homeLon, int radiusNm,
     if (ac["gs"].is<float>()) {
       dst.groundSpeedKts = ac["gs"].as<float>();
     } else if (ac["gs"].is<int>()) {
-      dst.groundSpeedKts = static_cast<float>(ac["gs"].is<int>());
+      dst.groundSpeedKts = static_cast<float>(ac["gs"].as<int>());
     }
 
     if (ac["track"].is<float>()) {

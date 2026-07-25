@@ -12,11 +12,15 @@ class InfoPanel {
   void create(lv_obj_t *parent);
   void showAircraft(const Aircraft *aircraft);
   void showStatus(const char *status);
+  void updateClock();
 
  private:
   void setField(lv_obj_t *valueLabel, const char *value);
 
   lv_obj_t *panel_ = nullptr;
+  lv_obj_t *clockContainer_ = nullptr;
+  lv_obj_t *timeLabel_ = nullptr;
+  lv_obj_t *dateLabel_ = nullptr;
   lv_obj_t *statusLabel_ = nullptr;
   lv_obj_t *aircraft_ = nullptr;
   lv_obj_t *flight_ = nullptr;

@@ -47,10 +47,27 @@ void InfoPanel::create(lv_obj_t *parent) {
   lv_obj_set_style_pad_row(panel_, 8, 0);
   lv_obj_clear_flag(panel_, LV_OBJ_FLAG_SCROLLABLE);
 
-  lv_obj_t *title = lv_label_create(panel_);
-  lv_label_set_text(title, "Aircraft");
-  lv_obj_set_style_text_color(title, lv_color_hex(0xF0F4F8), 0);
-  lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+  // Large clock display at the top.
+  clockContainer_ = lv_obj_create(panel_);
+  lv_obj_set_height(clockContainer_, LV_SIZE_CONTENT);
+  lv_obj_set_width(clockContainer_, LV_PCT(100));
+  lv_obj_set_style_bg_color(clockContainer_, lv_color_hex(0x1E2A36), 0);
+  lv_obj_set_style_bg_opa(clockContainer_, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(clockContainer_, 8, 0);
+  lv_obj_set_style_border_width(clockContainer_, 0, 0);
+  lv_obj_set_style_pad_all(clockContainer_, 16, 0);
+  lv_obj_set_flex_flow(clockContainer_, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(clockContainer_, 4, 0);
+
+  timeLabel_ = lv_label_create(clockContainer_);
+  lv_label_set_text(timeLabel_, "--:--:--");
+  lv_obj_set_style_text_color(timeLabel_, lv_color_hex(0xE8EEF4), 0);
+  lv_obj_set_style_text_font(timeLabel_, &lv_font_montserrat_48, 0);
+
+  dateLabel_ = lv_label_create(clockContainer_);
+  lv_label_set_text(dateLabel_, "------------");
+  lv_obj_set_style_text_color(dateLabel_, lv_color_hex(0x7A8A9A), 0);
+  lv_obj_set_style_text_font(dateLabel_, &lv_font_montserrat_14, 0);
 
   statusLabel_ = lv_label_create(panel_);
   lv_label_set_text(statusLabel_, "Connecting...");
@@ -74,6 +91,23 @@ void InfoPanel::create(lv_obj_t *parent) {
   addField(fieldsCont_, "Distance", &distance_);
   addField(fieldsCont_, "Origin", &origin_);
   addField(fieldsCont_, "Destination", &destination_);
+}
+
+void InfoPanel::updateClock() {
+  if (timeLabel_ == nullptr || dateLabel_ == nullptr) return;
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 2000)) {
+    return;
+  }
+  char buf[9];
+  snprintf(buf, sizeof(buf), "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  lv_label_set_text(timeLabel_, buf);
+
+  const char months[] = "Jan\0Feb\0Mar\0Apr\0May\0Jun\0Jul\0Aug\0Sep\0Oct\0Nov\0Dec";
+  char dateBuf[32];
+  snprintf(dateBuf, sizeof(dateBuf), "%d %s %d", timeinfo.tm_mday, months + (timeinfo.tm_mon * 4), 1900 + timeinfo.tm_year);
+  lv_label_set_text(dateLabel_, dateBuf);
 }
 
 void InfoPanel::setField(lv_obj_t *valueLabel, const char *value) {
