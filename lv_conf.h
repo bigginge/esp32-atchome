@@ -27,8 +27,29 @@
 #define LV_FONT_MONTSERRAT_48 1
 #define LV_FONT_DEFAULT &lv_font_montserrat_14
 
+// The stock theme is light, which would put grey chrome on the app's dark
+// background the moment the settings menu adds a button or a textarea.
+#define LV_THEME_DEFAULT_DARK 1
+
+// Button-matrix keys auto-repeat on long press (only the keyboard's *control*
+// keys carry NO_REPEAT), and a deliberate press on the GT911 easily crosses the
+// 400 ms default, duplicating characters. See also the NO_REPEAT ctrl maps in
+// settings_screen.cpp.
+#define LV_INDEV_LONG_PRESS_TIME 700
+
 #define LV_USE_FLEX 1
 #define LV_USE_CANVAS 1
 #define LV_USE_LABEL 1
+
+// Used by the settings menu. These all default to 1 when left undefined, but
+// the list above reads as "the only widgets in use" -- keep it truthful.
+#define LV_USE_BUTTON 1
+#define LV_USE_BUTTONMATRIX 1
+#define LV_USE_TEXTAREA 1
+#define LV_USE_KEYBOARD 1
+#define LV_USE_LIST 1
+#define LV_USE_SPINNER 1
+#define LV_USE_ARC 1
+#define LV_USE_IMAGE 1
 
 #endif /* LV_CONF_H */

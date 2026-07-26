@@ -10,13 +10,16 @@
 #include <freertos/semphr.h>
 #include <string.h>
 
-#include "config.h"
+#include "settings.hpp"
+#include "net_control.hpp"
+#include "geo_ip.hpp"
 #include "crowpanel_display.hpp"
 #include "gt911.hpp"
 #include "api_client.hpp"
 #include "tracker.hpp"
 #include "radar_view.hpp"
 #include "info_panel.hpp"
+#include "settings_screen.hpp"
 
 static constexpr uint16_t kHorRes = 800;
 static constexpr uint16_t kVerRes = 480;
@@ -39,6 +42,7 @@ static GT911 touch;
 static Tracker tracker;
 static RadarView radarView;
 static InfoPanel infoPanel;
+static SettingsScreen settingsScreen;
 
 // snapshot: network-task fetch buffer. selCopy: UI copy of the selection.
 static Aircraft snapshot[kMaxAircraft];
@@ -46,11 +50,15 @@ static Aircraft selCopy;
 
 // Shared state between the UI task (core 1) and the network task (core 0).
 static SemaphoreHandle_t gMutex = nullptr;
+static TaskHandle_t gNetTaskHandle = nullptr;
 static volatile bool gDataDirty = false;
 static volatile int gNetStatus = 0;  // 0 ok, 1 wifi reconnecting, 2 fetch failed
 static volatile unsigned long gLastFetchOkMs = 0;
 static volatile bool gHadFirstFetch = false;
 static volatile uint32_t gFreeInternal = 0;  // free internal heap (bytes)
+// Set when a settings save invalidated the tracked aircraft; clears the UI's
+// cached render state so the next paint is unconditional.
+static bool gUiResetRequested = false;
 
 static uint32_t lvTickCb() { return millis(); }
 
@@ -92,6 +100,108 @@ static void resetTouchViaPca9557() {
   ioExpander.pinMode(1, INPUT);
 }
 
+// ===== Setup-mode worker (core 0) =====
+// These run only while networkTask is parked, so they can take over the WiFi
+// stack without racing an in-flight fetch.
+
+static int runScan() {
+  // Deliberately no WiFi.disconnect() first: esp_wifi_scan_start works while
+  // associated, which keeps Cancel a true no-op. It does stall TCP for the
+  // duration, which is harmless *because* the task is parked -- if the parking
+  // ever goes away, this is where the mysterious fetch failures come from.
+  // 120 ms/channel instead of the 300 ms default turns a ~4 s sweep into ~1.7 s.
+  const int16_t n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false,
+                                      /*passive=*/false, /*max_ms_per_chan=*/120);
+  ScanEntry *out = netctl::scanBuffer();
+  size_t k = 0;
+  for (int16_t i = 0; i < n && k < kMaxScanEntries; ++i) {
+    const String ssid = WiFi.SSID(i);
+    if (ssid.isEmpty()) {
+      continue;  // hidden AP; reachable via "Other network..."
+    }
+    bool duplicate = false;
+    for (size_t j = 0; j < k; ++j) {
+      if (strcmp(out[j].ssid, ssid.c_str()) == 0) {
+        duplicate = true;  // same network on 2.4 and 5 GHz, or a mesh node
+        break;
+      }
+    }
+    if (duplicate) {
+      continue;
+    }
+    strncpy(out[k].ssid, ssid.c_str(), sizeof(out[k].ssid) - 1);
+    out[k].ssid[sizeof(out[k].ssid) - 1] = '\0';
+    const int32_t rssi = WiFi.RSSI(i);
+    out[k].rssi = static_cast<int8_t>(rssi < -127 ? -127 : (rssi > 0 ? 0 : rssi));
+    out[k].secure = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+    ++k;
+  }
+  // The driver calloc's its record array from internal heap; release it now
+  // rather than holding it for however long the wizard stays open.
+  WiFi.scanDelete();
+
+  // Strongest first (insertion sort; k <= 24).
+  for (size_t a = 1; a < k; ++a) {
+    const ScanEntry tmp = out[a];
+    size_t b = a;
+    while (b > 0 && out[b - 1].rssi < tmp.rssi) {
+      out[b] = out[b - 1];
+      --b;
+    }
+    out[b] = tmp;
+  }
+
+  netctl::setScanCount(k);
+  Serial.printf("[setup] scan: %u networks\n", static_cast<unsigned>(k));
+  return static_cast<int>(k);
+}
+
+static int runConnect() {
+  const char *ssid = nullptr;
+  const char *pass = nullptr;
+  netctl::connectArgs(&ssid, &pass);
+  Serial.printf("[setup] connecting to \"%s\"\n", ssid);
+
+  WiFi.disconnect(false);
+  WiFi.begin(ssid, pass[0] != '\0' ? pass : nullptr);
+
+  const unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+
+  const int status = static_cast<int>(WiFi.status());
+  if (status == WL_CONNECTED) {
+    Serial.printf("[setup] connected %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.printf("[setup] connect failed, status %d\n", status);
+  }
+  return status;
+}
+
+static void serveSetupCommand() {
+  SetupCmd cmd = SetupCmd::None;
+  if (!netctl::takeCommand(&cmd)) {
+    return;
+  }
+
+  int result = 0;
+  switch (cmd) {
+    case SetupCmd::Scan:
+      result = runScan();
+      break;
+    case SetupCmd::Connect:
+      result = runConnect();
+      break;
+    case SetupCmd::Geolocate:
+      result = fetchIpLocation(netctl::geoBuffer()) ? 1 : 0;
+      break;
+    case SetupCmd::None:
+      break;
+  }
+  netctl::completeCommand(result);
+}
+
 // ===== Network task (core 0): all HTTP lives here so the UI never blocks. =====
 
 static void networkTask(void * /*arg*/) {
@@ -99,16 +209,52 @@ static void networkTask(void * /*arg*/) {
   unsigned long lastEnrichAttempt = 0;
   bool lastEnrichFailed = false;
   unsigned long lastFetch = 0;
+  uint32_t seenEpoch = netctl::epoch();
 
   for (;;) {
+    // Park for the settings menu. This check has to stay at the very top of
+    // the loop: it is the one point where no TLS transaction is in flight and
+    // no lock is held, which is what makes handing the WiFi stack to the UI
+    // safe without suspending this task.
+    if (netctl::setupModeRequested()) {
+      netctl::acknowledgeParked(true);
+      serveSetupCommand();
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+    netctl::acknowledgeParked(false);
+
+    if (seenEpoch != netctl::epoch()) {
+      seenEpoch = netctl::epoch();
+      lastFetch = 0;             // refetch now, against the new home location
+      lastEnrichedHex[0] = '\0';
+    }
+
+    // Re-read every pass: the settings menu can change any of these from the
+    // UI core while this task is running.
+    double homeLat = 0.0;
+    double homeLon = 0.0;
+    int radiusNm = 0;
+    char ssid[33];
+    char pass[64];
+    settings::snapshotForNetwork(&homeLat, &homeLon, &radiusNm, ssid, sizeof(ssid), pass,
+                                 sizeof(pass));
+
     if (WiFi.status() != WL_CONNECTED) {
       gNetStatus = 1;
       gDataDirty = true;
       WiFi.disconnect();
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      WiFi.begin(ssid, pass[0] != '\0' ? pass : nullptr);
       const unsigned long start = millis();
-      while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+      // Bail out the moment the menu is opened. Users reach for the gear
+      // precisely because WiFi is broken, so this is the common case, and
+      // without the check parking here would take 15 s instead of 250 ms.
+      while (WiFi.status() != WL_CONNECTED && millis() - start < 15000 &&
+             !netctl::setupModeRequested()) {
         vTaskDelay(pdMS_TO_TICKS(250));
+      }
+      if (netctl::setupModeRequested()) {
+        continue;
       }
       if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("[WiFi] Reconnected %s\n", WiFi.localIP().toString().c_str());
@@ -121,14 +267,15 @@ static void networkTask(void * /*arg*/) {
     }
 
     const unsigned long now = millis();
-    if (lastFetch == 0 || now - lastFetch >= REFRESH_INTERVAL_MS) {
+    if (lastFetch == 0 || now - lastFetch >= settings::kRefreshIntervalMs) {
       lastFetch = now;
       gFreeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
       Serial.printf("[mem] free internal %u B before fetch\n",
                     static_cast<unsigned>(gFreeInternal));
       size_t count = 0;
-      const bool ok = fetchNearbyAircraft(MY_LATITUDE, MY_LONGITUDE, SEARCH_RADIUS_NM,
-                                          snapshot, kMaxAircraft, &count);
+      const bool ok = fetchNearbyAircraft(static_cast<float>(homeLat),
+                                          static_cast<float>(homeLon), radiusNm, snapshot,
+                                          kMaxAircraft, &count);
       if (ok) {
         xSemaphoreTake(gMutex, portMAX_DELAY);
         tracker.mergeSnapshot(snapshot, count);
@@ -194,24 +341,51 @@ static void networkTask(void * /*arg*/) {
   }
 }
 
-static void connectWiFi() {
+/** Blocking connect that keeps the UI alive by pumping LVGL while it waits.
+ *  UI task only. Leaves NTP to the caller so the boot path and the network
+ *  task's reconnect path stay in step. */
+static bool connectWiFi(const char *ssid, const char *pass, uint32_t timeoutMs) {
   infoPanel.showStatus("Connecting WiFi...");
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(ssid, pass != nullptr && pass[0] != '\0' ? pass : nullptr);
 
   const unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
     lv_timer_handler();
     delay(50);
   }
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("[WiFi] Connected %s\n", WiFi.localIP().toString().c_str());
-    configTzTime("GMT0BST,M3.5.0,M10.5.0", "pool.ntp.org");
-  } else {
-    Serial.println("[WiFi] Connection failed");
-    infoPanel.showStatus("WiFi failed");
+    return true;
   }
+  Serial.println("[WiFi] Connection failed");
+  infoPanel.showStatus("WiFi failed");
+  return false;
+}
+
+/** Applies the fallout of a settings save. Home lat/lon is the origin of every
+ *  aircraft's east/north offsets *and* of its trail history, so a location
+ *  change invalidates all of it and there is no in-place fix: the only correct
+ *  answer is to throw the tracked set away and refetch. UI task only. */
+static void applySettingsChange() {
+  if (!settingsScreen.consumeSettingsChanged()) {
+    return;
+  }
+
+  netctl::bumpEpoch();  // makes the network task refetch immediately
+
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  tracker.clear();
+  xSemaphoreGive(gMutex);
+
+  // radarView is exclusively UI-owned, so this is deliberately outside the lock.
+  radarView.setRangeNm(static_cast<float>(settings::get().radiusNm));
+
+  gUiResetRequested = true;
+  gDataDirty = true;
+  gHadFirstFetch = false;
+  gLastFetchOkMs = 0;
 }
 
 static bool initLvgl() {
@@ -235,7 +409,7 @@ static bool initLvgl() {
   lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 
   infoPanel.create(screen);
-  if (!radarView.create(screen, static_cast<float>(SEARCH_RADIUS_NM))) {
+  if (!radarView.create(screen, static_cast<float>(settings::get().radiusNm))) {
     return false;
   }
 
@@ -247,10 +421,16 @@ void setup() {
   delay(200);
   Serial.println();
   Serial.println("===== ESP32 ATC Home =====");
-  Serial.printf("Home: %.4f, %.4f  radius %d nm\n", MY_LATITUDE, MY_LONGITUDE,
-                SEARCH_RADIUS_NM);
 
   gMutex = xSemaphoreCreateMutex();
+
+  // Before anything reads the radius or the credentials.
+  settings::load();
+  {
+    const AppSettings &cfg = settings::get();
+    Serial.printf("Home: %.6f, %.6f  radius %d nm\n", cfg.latitude, cfg.longitude,
+                  cfg.radiusNm);
+  }
 
   Serial.println("Reset touch controller...");
   resetTouchViaPca9557();
@@ -268,10 +448,45 @@ void setup() {
     return;
   }
 
-  connectWiFi();
+  // Before the first WiFi call. The driver otherwise runs in persistent mode
+  // and rewrites nvs.net80211 on every WiFi.begin() -- including the one the
+  // reconnect loop issues every 15 s while the AP is down.
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
 
   // Networking on core 0 (WiFi's core); the Arduino loop (UI + LVGL) owns core 1.
-  xTaskCreatePinnedToCore(networkTask, "net", 16384, nullptr, 5, nullptr, 0);
+  // Started before the wizard so the wizard can use it as its scan / connect /
+  // geolocate worker; it parks immediately and costs nothing. Setup mode is
+  // requested *first* so the task parks on its very first pass and never races
+  // the boot connect below for the WiFi stack.
+  netctl::enterSetupMode();
+  xTaskCreatePinnedToCore(networkTask, "net", 16384, nullptr, 5, &gNetTaskHandle, 0);
+
+  // The worker stays parked for this whole loop: connectWiFi() runs on the UI
+  // task, and an unparked worker would see a disconnected radio and issue its
+  // own competing WiFi.begin().
+  bool connected = false;
+  for (;;) {
+    if (settings::hasWifi()) {
+      const AppSettings &cfg = settings::get();
+      connected = connectWiFi(cfg.ssid, cfg.password, 20000);
+    }
+    if (connected && settings::get().locationConfirmed) {
+      break;
+    }
+
+    settingsScreen.open(connected ? SettingsStep::Location : SettingsStep::Network,
+                        connected ? nullptr : "Set up a network to get started");
+    while (settingsScreen.isOpen()) {
+      lv_timer_handler();
+      delay(5);
+    }
+    applySettingsChange();
+    connected = WiFi.status() == WL_CONNECTED;
+  }
+
+  netctl::exitSetupMode();
+  configTzTime("GMT0BST,M3.5.0,M10.5.0", "pool.ntp.org");
 
   Serial.printf("[mem] free internal after init: %u B\n",
                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
@@ -280,6 +495,31 @@ void setup() {
 
 void loop() {
   lv_timer_handler();
+
+  // ===== Settings wizard =====
+  // While it is open, skip the rest of loop(): RadarView::redraw() rasterises
+  // the full 480x480 PSRAM canvas every 50 ms whether or not anything will
+  // blit it, and the wizard's overlay hides it anyway.
+  static bool inSetupMode = false;
+  if (settingsScreen.isOpen()) {
+    delay(5);
+    return;
+  }
+  if (inSetupMode) {
+    inSetupMode = false;
+    applySettingsChange();
+    netctl::exitSetupMode();
+  }
+  if (infoPanel.consumeSettingsRequest()) {
+    // Opened here rather than in the gear's event callback: doing it there
+    // would re-enter lv_timer_handler() from inside an LVGL event, which
+    // corrupts the display refresh rather than failing cleanly.
+    radarView.consumePendingClick(nullptr, nullptr);  // drop a tap made just before
+    inSetupMode = true;
+    netctl::enterSetupMode();
+    settingsScreen.open(SettingsStep::Location, nullptr);
+    return;
+  }
 
   // Handle a pending touch selection (radar records it; mutate under the lock).
   float ce = 0.0f;
@@ -299,6 +539,16 @@ void loop() {
   static bool everPainted = false;
   static char uiSelHex[8] = {0};
   static unsigned long lastClockMs = 0;
+
+  if (gUiResetRequested) {
+    gUiResetRequested = false;
+    // The redraw below is gated on everPainted, so without clearing it a radius
+    // change with no *moving* aircraft would leave the old rings on screen.
+    everPainted = false;
+    uiSelHex[0] = '\0';
+    uiHasSel = false;
+    uiCount = 0;
+  }
 
   // Animate + redraw the radar (under the lock; only when something changed).
   if (now - lastFrameMs >= kRadarFrameMs) {

@@ -23,6 +23,7 @@ Live ADS-B traffic on a square radar (left) with an aircraft detail panel (right
 - **Responsive UI**: all network requests run on the ESP32-S3's second core, so the radar animates smoothly and touch stays responsive while data is fetched
 - **Touch select**: tap an aircraft to highlight it and load details; selection clears when it leaves range; defaults to the nearest aircraft
 - **Data**: [adsb.fi](https://adsb.fi/) positions (polled every 5 s); [hexdb.io](https://hexdb.io/) aircraft and route enrichment (lazy, for the selection)
+- **On-device setup**: pick your WiFi network and type the password on the touchscreen, and set your location (optionally prefilled from IP geolocation). Nothing is hardcoded; settings live in NVS and are reachable any time from the gear button on the info panel
 
 ## Prerequisites
 
@@ -44,12 +45,42 @@ Board index (see `arduino-cli.yaml`):
 
 ## Configuration
 
+Nothing needs configuring at build time. Flash the sketch and the device walks you
+through setup on its own screen:
+
+1. **WiFi** — pick your network from the scan list (or *Other network...* for a hidden
+   SSID) and type the password on the on-screen keyboard.
+2. **Location** — the fields are prefilled from your saved settings, with a suggestion
+   derived from your public IP shown above them. Tap **Use detected** to accept it, or
+   type your own coordinates. IP geolocation is city-level at best and can be far out;
+   since the radar draws the whole search radius across 480 px, it is worth entering
+   real coordinates ([latlong.net](https://www.latlong.net/)) if the suggestion looks off.
+
+Settings are stored in NVS and survive reflashing. Tap the **gear** in the top-right of
+the info panel to change them later — including moving the device to a different network.
+
+### Optional: seed the settings at build time
+
 ```bash
 cp config.example.h config.h
 ```
 
-Edit `config.h`: WiFi SSID/password, latitude/longitude, a friendly location name, search radius, refresh interval.  
-`config.h` is gitignored.
+`config.h` (gitignored) is a convenience for pre-filling a device you flash often. Its
+values are written to NVS **once, on first boot**, and if it supplies a WiFi network the
+wizard is skipped entirely.
+
+> **After that first boot, `config.h` is inert.** Editing it and reflashing changes
+> nothing, because NVS already holds the settings. Change things from the wizard, or
+> wipe NVS with `esptool erase_flash` to seed again.
+
+### Notes
+
+- WPA/TKIP-only access points are refused: the ESP32 core's default minimum security is
+  `WIFI_AUTH_WPA2_PSK`. Open networks and WPA2/WPA3 work.
+- The IP-geolocation lookup ([ip-api.com](https://ip-api.com/)) is plain HTTP — its free
+  tier has no TLS endpoint. It is only ever a suggestion you confirm on screen, and the
+  coordinates are range-checked before being offered. Everything else the device fetches
+  goes over HTTPS.
 
 ## Build / upload
 
@@ -67,14 +98,19 @@ Or: `make compile` / `make PORT=COM3 upload`
 esp32-atchome/
 ├── esp32-atchome.ino
 ├── config.example.h
-├── config.h                 # local, gitignored
+├── config.h                 # optional first-boot seed, gitignored
 ├── lv_conf.h
 ├── src/
 │   ├── main.cpp
 │   ├── crowpanel_display.hpp
 │   ├── aircraft.hpp
 │   ├── geo.hpp
+│   ├── text_util.hpp
 │   ├── api_client.cpp/.hpp
+│   ├── geo_ip.cpp/.hpp       # IP geolocation (plain HTTP; suggestion only)
+│   ├── settings.cpp/.hpp     # NVS-backed runtime config
+│   ├── net_control.cpp/.hpp  # UI <-> network-task command channel
+│   ├── settings_screen.cpp/.hpp
 │   ├── tracker.cpp/.hpp
 │   ├── radar_view.cpp/.hpp
 │   └── info_panel.cpp/.hpp

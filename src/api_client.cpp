@@ -1,6 +1,7 @@
 #include "api_client.hpp"
 
 #include "geo.hpp"
+#include "text_util.hpp"
 
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
@@ -8,17 +9,6 @@
 #include <string.h>
 
 static constexpr uint16_t kHttpTimeoutMs = 4000;
-
-static void sanitizeAscii(char *str) {
-  if (str == nullptr) return;
-  char *dst = str;
-  for (char *src = str; *src; ++src) {
-    if ((static_cast<unsigned char>(*src) & 0x80) == 0) {
-      *dst++ = *src;
-    }
-  }
-  *dst = '\0';
-}
 
 static void safeJsonCopy(char *dest, size_t destSize, JsonObject obj, const char *key) {
   dest[0] = '\0';
@@ -102,30 +92,46 @@ bool fetchNearbyAircraft(float homeLat, float homeLon, int radiusNm,
   }
 
   size_t count = 0;
+  size_t farthest = 0;  // index of the worst entry once out[] is full
   for (JsonObject ac : aircraft) {
-    if (count >= maxCount) {
-      break;
-    }
     if (!ac["lat"].is<float>() || !ac["lon"].is<float>()) {
       continue;
     }
 
-    Aircraft &dst = out[count];
-    clearSnapshotFields(dst);
+    // Once full, keep the nearest maxCount rather than whatever the API
+    // happened to list first. Checking distance before copying any fields
+    // avoids needing a ~384-byte scratch Aircraft on the network task stack.
+    const float lat = ac["lat"].as<float>();
+    const float lon = ac["lon"].as<float>();
+    const float distNm = haversineNm(homeLat, homeLon, lat, lon);
+    size_t slot = count;
+    if (count >= maxCount) {
+      if (distNm >= out[farthest].distanceNm) {
+        continue;
+      }
+      slot = farthest;
+    }
 
-    safeJsonCopy(dst.hex, sizeof(dst.hex), ac, "hex");
-    if (dst.hex[0] == '\0') {
+    // Check hex before clearing: when slot is being reused, a bail-out after
+    // the memset would destroy a good entry.
+    char hex[8];
+    safeJsonCopy(hex, sizeof(hex), ac, "hex");
+    if (hex[0] == '\0') {
       continue;
     }
+
+    Aircraft &dst = out[slot];
+    clearSnapshotFields(dst);
+    memcpy(dst.hex, hex, sizeof(dst.hex));
 
     safeJsonCopy(dst.callsign, sizeof(dst.callsign), ac, "flight");
     safeJsonCopy(dst.registration, sizeof(dst.registration), ac, "r");
     safeJsonCopy(dst.typeCode, sizeof(dst.typeCode), ac, "t");
 
-    dst.lat = ac["lat"].as<float>();
-    dst.lon = ac["lon"].as<float>();
+    dst.lat = lat;
+    dst.lon = lon;
     latLonToNm(homeLat, homeLon, dst.lat, dst.lon, &dst.eastNm, &dst.northNm);
-    dst.distanceNm = haversineNm(homeLat, homeLon, dst.lat, dst.lon);
+    dst.distanceNm = distNm;
 
     if (ac["alt_baro"].is<int>()) {
       dst.altitudeFt = ac["alt_baro"].as<int>();
@@ -148,7 +154,19 @@ bool fetchNearbyAircraft(float homeLat, float homeLon, int radiusNm,
     }
 
     dst.seen = true;
-    ++count;
+    if (slot == count) {
+      ++count;
+    }
+
+    // Re-find the worst entry so the next eviction has a target.
+    if (count >= maxCount) {
+      farthest = 0;
+      for (size_t i = 1; i < count; ++i) {
+        if (out[i].distanceNm > out[farthest].distanceNm) {
+          farthest = i;
+        }
+      }
+    }
   }
 
   *outCount = count;

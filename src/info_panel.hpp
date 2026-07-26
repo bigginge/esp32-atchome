@@ -15,7 +15,14 @@ class InfoPanel {
   void showStatus(const char *status);
   void updateClock();
 
+  /** True once if the settings gear was tapped since the last call. Matches
+   *  RadarView::consumePendingClick: the tap is recorded here and acted on from
+   *  loop(), never inside the LVGL event callback. */
+  bool consumeSettingsRequest();
+
  private:
+  static void onSettingsClicked(lv_event_t *e);
+
   // Hides the whole caption+value block when the value is empty.
   void setField(lv_obj_t *valueLabel, const char *value);
   // Hides only the label itself; for labels that share a block with siblings.
@@ -37,4 +44,6 @@ class InfoPanel {
   lv_obj_t *originName_ = nullptr;
   lv_obj_t *destName_ = nullptr;
   lv_obj_t *fieldsCont_ = nullptr;
+  lv_obj_t *settingsBtn_ = nullptr;
+  volatile bool settingsRequested_ = false;
 };

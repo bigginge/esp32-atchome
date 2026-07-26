@@ -162,6 +162,36 @@ void InfoPanel::create(lv_obj_t *parent) {
   lv_label_set_text(statsLabel_, "");
   lv_obj_set_style_text_color(statsLabel_, lv_color_hex(0x7A8A9A), 0);
   lv_obj_set_style_text_font(statsLabel_, &lv_font_montserrat_14, 0);
+
+  // Settings gear. IGNORE_LAYOUT keeps the flex column from placing it, so it
+  // floats over the empty right-hand side of the clock block (the 48 px time
+  // hugs the left) without reflowing anything above.
+  settingsBtn_ = lv_button_create(panel_);
+  lv_obj_add_flag(settingsBtn_, LV_OBJ_FLAG_IGNORE_LAYOUT);
+  lv_obj_set_size(settingsBtn_, 40, 40);
+  lv_obj_align(settingsBtn_, LV_ALIGN_TOP_RIGHT, -4, 4);
+  lv_obj_set_style_bg_color(settingsBtn_, lv_color_hex(0x1E2A36), 0);
+  lv_obj_set_style_bg_opa(settingsBtn_, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(settingsBtn_, 0, 0);
+  lv_obj_set_style_radius(settingsBtn_, 8, 0);
+  lv_obj_add_event_cb(settingsBtn_, onSettingsClicked, LV_EVENT_CLICKED, this);
+
+  lv_obj_t *gear = lv_label_create(settingsBtn_);
+  lv_label_set_text(gear, LV_SYMBOL_SETTINGS);
+  lv_obj_set_style_text_color(gear, lv_color_hex(0xA0B0C0), 0);
+  lv_obj_center(gear);
+}
+
+void InfoPanel::onSettingsClicked(lv_event_t *e) {
+  static_cast<InfoPanel *>(lv_event_get_user_data(e))->settingsRequested_ = true;
+}
+
+bool InfoPanel::consumeSettingsRequest() {
+  if (!settingsRequested_) {
+    return false;
+  }
+  settingsRequested_ = false;
+  return true;
 }
 
 void InfoPanel::setStats(size_t inRange, long secondsSinceUpdate) {
