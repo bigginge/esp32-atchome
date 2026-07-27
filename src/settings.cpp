@@ -1,4 +1,5 @@
 #include "settings.hpp"
+#include "log.hpp"
 
 #include <Arduino.h>
 #include <Preferences.h>
@@ -131,7 +132,7 @@ void load() {
 
   Preferences prefs;
   if (!prefs.begin(kNamespace, /*readOnly=*/false)) {
-    Serial.println("[settings] NVS open failed; running from compile-time defaults");
+    Log.println("[settings] NVS open failed; running from compile-time defaults");
     publish(v);
     return;
   }
@@ -139,7 +140,7 @@ void load() {
   if (prefs.getUChar(kKeyVer, 0) != kSchemaVersion) {
     writeAll(prefs, v);
     prefs.putUChar(kKeyVer, kSchemaVersion);
-    Serial.println("[settings] first boot: seeded NVS from compile-time defaults");
+    Log.println("[settings] first boot: seeded NVS from compile-time defaults");
   } else {
     readString(prefs, kKeySsid, v.ssid, sizeof(v.ssid));
     readString(prefs, kKeyPass, v.password, sizeof(v.password));
@@ -165,7 +166,7 @@ bool save(const AppSettings &in) {
 
   Preferences prefs;
   if (!prefs.begin(kNamespace, /*readOnly=*/false)) {
-    Serial.println("[settings] NVS open failed; not saved");
+    Log.println("[settings] NVS open failed; not saved");
     return false;
   }
 
@@ -206,7 +207,7 @@ bool save(const AppSettings &in) {
   publish(v);
   if (changed) {
     ++gEpoch;
-    Serial.printf("[settings] saved: %.6f, %.6f  radius %d nm  ssid \"%s\"\n", v.latitude,
+    Log.printf("[settings] saved: %.6f, %.6f  radius %d nm  ssid \"%s\"\n", v.latitude,
                   v.longitude, v.radiusNm, v.ssid);
   }
   return changed;

@@ -1,13 +1,14 @@
 #pragma once
 
 #include "aircraft.hpp"
+#include "theme.hpp"
 
 #include <lvgl.h>
 
 class InfoPanel {
  public:
-  static constexpr int32_t kWidth = 320;
-  static constexpr int32_t kHeight = 480;
+  static constexpr int32_t kWidth = theme::layout::kPanelW;
+  static constexpr int32_t kHeight = theme::layout::kPanelH;
 
   void create(lv_obj_t *parent);
   void setStats(size_t inRange, long secondsSinceUpdate);

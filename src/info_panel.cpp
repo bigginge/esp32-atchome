@@ -1,43 +1,62 @@
 #include "info_panel.hpp"
 
+#include "theme.hpp"
+
 #include <Arduino.h>
 #include <stdio.h>
 #include <string.h>
 
-// The panel is a fixed 320x480 with no scrolling, so every block must have a
-// deterministic height: values are single-line marquees rather than wrapping
-// labels, otherwise a long airport name pushes the route off the bottom.
-static constexpr int32_t kBlockPadBottom = 8;
+// The panel is a fixed width with no scrolling, so every block must have a
+// deterministic height: values are single-line and ellipsized rather than
+// wrapping, otherwise a long airport name pushes the route off the bottom.
+static constexpr int32_t kBlockPadBottom = theme::kSp2;
+
+/** Transparent grouping container: the shared half of every block below. */
+static lv_obj_t *makeContainer(lv_obj_t *parent) {
+  lv_obj_t *obj = lv_obj_create(parent);
+  lv_obj_add_style(obj, &theme::stylePlain, 0);
+  lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+  return obj;
+}
 
 static lv_obj_t *makeBlock(lv_obj_t *parent) {
-  lv_obj_t *block = lv_obj_create(parent);
+  lv_obj_t *block = makeContainer(parent);
   lv_obj_set_width(block, LV_PCT(100));
   lv_obj_set_height(block, LV_SIZE_CONTENT);
-  lv_obj_set_style_bg_opa(block, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(block, 0, 0);
-  lv_obj_set_style_pad_all(block, 0, 0);
   lv_obj_set_style_pad_bottom(block, kBlockPadBottom, 0);
   lv_obj_set_flex_flow(block, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(block, 2, 0);
-  lv_obj_clear_flag(block, LV_OBJ_FLAG_SCROLLABLE);
   return block;
 }
 
 static lv_obj_t *makeCaption(lv_obj_t *parent, const char *caption) {
   lv_obj_t *captionLabel = lv_label_create(parent);
   lv_label_set_text(captionLabel, caption);
-  lv_obj_set_style_text_color(captionLabel, lv_color_hex(0x7A8A9A), 0);
-  lv_obj_set_style_text_font(captionLabel, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_letter_space(captionLabel, 1, 0);
+  lv_obj_add_style(captionLabel, &theme::styleCaption, 0);
   return captionLabel;
 }
 
+/**
+ * A readout. Overflow ellipsizes rather than scrolling.
+ *
+ * These were circular-scroll marquees. Measured, that was very expensive: the
+ * animation steps continuously, and because the panel is built from
+ * LV_SIZE_CONTENT blocks with percentage widths, each step re-runs the flex
+ * layout for the column and repaints through the card beneath. lv_timer_handler
+ * cost ~80 ms per call even on iterations where the radar did not paint, and
+ * the main loop fell from ~60 to ~12 iterations a second. The animation was
+ * starving itself -- which is exactly what the visible jitter was.
+ *
+ * If scrolling names are wanted back, the blocks need fixed heights first (see
+ * the deterministic-height note at the top of this file); LV_SIZE_CONTENT is
+ * what makes each step cost a layout pass.
+ */
 static lv_obj_t *makeValue(lv_obj_t *parent, const lv_font_t *font) {
   lv_obj_t *valueLabel = lv_label_create(parent);
   lv_label_set_text(valueLabel, "—");
-  lv_label_set_long_mode(valueLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
+  lv_label_set_long_mode(valueLabel, LV_LABEL_LONG_DOT);
   lv_obj_set_width(valueLabel, LV_PCT(100));
-  lv_obj_set_style_text_color(valueLabel, lv_color_hex(0xE8EEF4), 0);
+  lv_obj_add_style(valueLabel, &theme::styleValue, 0);
   lv_obj_set_style_text_font(valueLabel, font, 0);
   return valueLabel;
 }
@@ -45,96 +64,95 @@ static lv_obj_t *makeValue(lv_obj_t *parent, const lv_font_t *font) {
 static lv_obj_t *addField(lv_obj_t *parent, const char *caption, lv_obj_t **valueOut) {
   lv_obj_t *block = makeBlock(parent);
   makeCaption(block, caption);
-  *valueOut = makeValue(block, &lv_font_montserrat_16);
+  *valueOut = makeValue(block, theme::fontBody());
   return block;
 }
 
 /** Row holding the short numeric readouts side by side. */
 static lv_obj_t *addMetricRow(lv_obj_t *parent) {
-  lv_obj_t *row = lv_obj_create(parent);
+  lv_obj_t *row = makeContainer(parent);
   lv_obj_set_width(row, LV_PCT(100));
   lv_obj_set_height(row, LV_SIZE_CONTENT);
-  lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(row, 0, 0);
-  lv_obj_set_style_pad_all(row, 0, 0);
   lv_obj_set_style_pad_bottom(row, kBlockPadBottom, 0);
   lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-  lv_obj_set_style_pad_column(row, 8, 0);
-  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_pad_column(row, theme::kSp2, 0);
   return row;
 }
 
+/** One of the three short readouts, on its own raised surface. Giving them
+ *  tiles rather than bare text is what makes the numbers read as the primary
+ *  data on the panel. */
 static void addMetric(lv_obj_t *row, const char *caption, lv_obj_t **valueOut) {
   lv_obj_t *col = lv_obj_create(row);
+  lv_obj_add_style(col, &theme::styleRaised, 0);
+  lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_height(col, LV_SIZE_CONTENT);
   lv_obj_set_flex_grow(col, 1);
-  lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(col, 0, 0);
-  lv_obj_set_style_pad_all(col, 0, 0);
+  lv_obj_set_style_pad_all(col, theme::kSp2, 0);
   lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(col, 2, 0);
-  lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
 
   makeCaption(col, caption);
-  *valueOut = makeValue(col, &lv_font_montserrat_16);
+  *valueOut = makeValue(col, theme::fontBody());
 }
 
 void InfoPanel::create(lv_obj_t *parent) {
+  // A column of cards over the page colour. The panel paints that colour itself
+  // rather than being transparent: it must be an opaque, square, border-free
+  // rectangle so LVGL's cover check stops the redraw walk here rather than
+  // propagating every repaint up to the screen background. The settings wizard
+  // root relies on the same property, for the same reason.
   panel_ = lv_obj_create(parent);
-  lv_obj_set_size(panel_, kWidth, kHeight);
-  lv_obj_set_pos(panel_, 480, 0);
-  lv_obj_set_style_bg_color(panel_, lv_color_hex(0x121A22), 0);
-  lv_obj_set_style_bg_opa(panel_, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(panel_, 0, 0);
-  lv_obj_set_style_radius(panel_, 0, 0);
-  lv_obj_set_style_pad_left(panel_, 16, 0);
-  lv_obj_set_style_pad_right(panel_, 16, 0);
-  lv_obj_set_style_pad_top(panel_, 16, 0);
-  lv_obj_set_style_pad_bottom(panel_, 16, 0);
-  lv_obj_set_flex_flow(panel_, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_pad_row(panel_, 8, 0);
+  lv_obj_add_style(panel_, &theme::stylePlain, 0);
   lv_obj_clear_flag(panel_, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_bg_color(panel_, theme::c(theme::kBgApp), 0);
+  lv_obj_set_style_bg_opa(panel_, LV_OPA_COVER, 0);
+  lv_obj_set_size(panel_, kWidth, kHeight);
+  lv_obj_set_pos(panel_, theme::layout::kPanelX, theme::layout::kPanelY);
+  lv_obj_set_flex_flow(panel_, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(panel_, theme::kSp3, 0);
 
   // Large clock display at the top.
   clockContainer_ = lv_obj_create(panel_);
+  lv_obj_add_style(clockContainer_, &theme::styleCard, 0);
+  lv_obj_clear_flag(clockContainer_, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_height(clockContainer_, LV_SIZE_CONTENT);
   lv_obj_set_width(clockContainer_, LV_PCT(100));
-  lv_obj_set_style_bg_color(clockContainer_, lv_color_hex(0x1E2A36), 0);
-  lv_obj_set_style_bg_opa(clockContainer_, LV_OPA_COVER, 0);
-  lv_obj_set_style_radius(clockContainer_, 8, 0);
-  lv_obj_set_style_border_width(clockContainer_, 0, 0);
-  lv_obj_set_style_pad_all(clockContainer_, 16, 0);
   lv_obj_set_flex_flow(clockContainer_, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_pad_row(clockContainer_, 4, 0);
+  lv_obj_set_style_pad_row(clockContainer_, theme::kSp1, 0);
 
   timeLabel_ = lv_label_create(clockContainer_);
   lv_label_set_text(timeLabel_, "--:--:--");
-  lv_obj_set_style_text_color(timeLabel_, lv_color_hex(0xE8EEF4), 0);
-  lv_obj_set_style_text_font(timeLabel_, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(timeLabel_, theme::c(theme::kText), 0);
+  lv_obj_set_style_text_font(timeLabel_, theme::fontClock(), 0);
 
   dateLabel_ = lv_label_create(clockContainer_);
   lv_label_set_text(dateLabel_, "------------");
-  lv_obj_set_style_text_color(dateLabel_, lv_color_hex(0x7A8A9A), 0);
-  lv_obj_set_style_text_font(dateLabel_, &lv_font_montserrat_14, 0);
+  lv_obj_add_style(dateLabel_, &theme::styleCaption, 0);
+  lv_obj_set_style_text_letter_space(dateLabel_, 0, 0);
 
-  statusLabel_ = lv_label_create(panel_);
+  // Second card: whichever of the status line or the detail fields is showing.
+  // It takes the remaining height so the stats footer stays pinned at the
+  // bottom of the panel.
+  lv_obj_t *bodyCard = lv_obj_create(panel_);
+  lv_obj_add_style(bodyCard, &theme::styleCard, 0);
+  lv_obj_clear_flag(bodyCard, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_width(bodyCard, LV_PCT(100));
+  lv_obj_set_flex_grow(bodyCard, 1);
+  lv_obj_set_flex_flow(bodyCard, LV_FLEX_FLOW_COLUMN);
+
+  statusLabel_ = lv_label_create(bodyCard);
   lv_label_set_text(statusLabel_, "Connecting...");
   lv_label_set_long_mode(statusLabel_, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(statusLabel_, LV_PCT(100));
-  // Grows so the stats line below stays pinned to the bottom of the panel.
-  lv_obj_set_flex_grow(statusLabel_, 1);
-  lv_obj_set_style_text_color(statusLabel_, lv_color_hex(0xA0B0C0), 0);
-  lv_obj_set_style_text_font(statusLabel_, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(statusLabel_, theme::c(theme::kTextDim), 0);
+  lv_obj_set_style_text_font(statusLabel_, theme::fontCaption(), 0);
 
-  fieldsCont_ = lv_obj_create(panel_);
+  fieldsCont_ = makeContainer(bodyCard);
   lv_obj_set_width(fieldsCont_, LV_PCT(100));
   lv_obj_set_flex_grow(fieldsCont_, 1);
-  lv_obj_set_style_bg_opa(fieldsCont_, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(fieldsCont_, 0, 0);
-  lv_obj_set_style_pad_all(fieldsCont_, 0, 0);
   lv_obj_set_flex_flow(fieldsCont_, LV_FLEX_FLOW_COLUMN);
   lv_obj_add_flag(fieldsCont_, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_clear_flag(fieldsCont_, LV_OBJ_FLAG_SCROLLABLE);
 
   addField(fieldsCont_, "AIRCRAFT", &aircraft_);
   addField(fieldsCont_, "FLIGHT", &flight_);
@@ -145,40 +163,37 @@ void InfoPanel::create(lv_obj_t *parent) {
   addMetric(metrics, "SPD", &speed_);
 
   // Route is one block: the codes headline the leg, the airport names sit
-  // beneath it and marquee when they are too long for the panel.
+  // beneath it and ellipsize when they are too long for the panel.
   routeBlock_ = makeBlock(fieldsCont_);
   makeCaption(routeBlock_, "ROUTE");
-  routeCodes_ = makeValue(routeBlock_, &lv_font_montserrat_20);
-  originName_ = makeValue(routeBlock_, &lv_font_montserrat_14);
-  lv_obj_set_style_text_color(originName_, lv_color_hex(0xA0B0C0), 0);
-  destName_ = makeValue(routeBlock_, &lv_font_montserrat_14);
-  lv_obj_set_style_text_color(destName_, lv_color_hex(0xA0B0C0), 0);
+  routeCodes_ = makeValue(routeBlock_, theme::fontTitle());
+  originName_ = makeValue(routeBlock_, theme::fontCaption());
+  lv_obj_set_style_text_color(originName_, theme::c(theme::kTextDim), 0);
+  destName_ = makeValue(routeBlock_, theme::fontCaption());
+  lv_obj_set_style_text_color(destName_, theme::c(theme::kTextDim), 0);
 
   // Promote the primary aircraft line for a clearer hierarchy.
-  lv_obj_set_style_text_font(aircraft_, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(aircraft_, theme::fontTitle(), 0);
 
   // Last child of the panel: the growing body above pushes it to the bottom.
   statsLabel_ = lv_label_create(panel_);
   lv_label_set_text(statsLabel_, "");
-  lv_obj_set_style_text_color(statsLabel_, lv_color_hex(0x7A8A9A), 0);
-  lv_obj_set_style_text_font(statsLabel_, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(statsLabel_, theme::c(theme::kTextMuted), 0);
+  lv_obj_set_style_text_font(statsLabel_, theme::fontCaption(), 0);
 
   // Settings gear. IGNORE_LAYOUT keeps the flex column from placing it, so it
-  // floats over the empty right-hand side of the clock block (the 48 px time
+  // floats over the empty right-hand side of the clock card (the big time
   // hugs the left) without reflowing anything above.
   settingsBtn_ = lv_button_create(panel_);
+  lv_obj_add_style(settingsBtn_, &theme::styleButton, 0);
   lv_obj_add_flag(settingsBtn_, LV_OBJ_FLAG_IGNORE_LAYOUT);
   lv_obj_set_size(settingsBtn_, 40, 40);
-  lv_obj_align(settingsBtn_, LV_ALIGN_TOP_RIGHT, -4, 4);
-  lv_obj_set_style_bg_color(settingsBtn_, lv_color_hex(0x1E2A36), 0);
-  lv_obj_set_style_bg_opa(settingsBtn_, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(settingsBtn_, 0, 0);
-  lv_obj_set_style_radius(settingsBtn_, 8, 0);
+  lv_obj_align(settingsBtn_, LV_ALIGN_TOP_RIGHT, -theme::kSp2, theme::kSp2);
   lv_obj_add_event_cb(settingsBtn_, onSettingsClicked, LV_EVENT_CLICKED, this);
 
   lv_obj_t *gear = lv_label_create(settingsBtn_);
   lv_label_set_text(gear, LV_SYMBOL_SETTINGS);
-  lv_obj_set_style_text_color(gear, lv_color_hex(0xA0B0C0), 0);
+  lv_obj_set_style_text_color(gear, theme::c(theme::kTextDim), 0);
   lv_obj_center(gear);
 }
 

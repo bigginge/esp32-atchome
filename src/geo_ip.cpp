@@ -1,4 +1,5 @@
 #include "geo_ip.hpp"
+#include "log.hpp"
 
 #include "text_util.hpp"
 
@@ -30,14 +31,14 @@ bool fetchIpLocation(GeoResult *out) {
   HTTPClient http;
 
   if (!http.begin(client, kUrl)) {
-    Serial.println("[geoip] begin failed");
+    Log.println("[geoip] begin failed");
     return false;
   }
 
   http.setTimeout(kHttpTimeoutMs);
   const int httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK) {
-    Serial.printf("[geoip] HTTP %d\n", httpCode);
+    Log.printf("[geoip] HTTP %d\n", httpCode);
     http.end();
     return false;
   }
@@ -46,14 +47,14 @@ bool fetchIpLocation(GeoResult *out) {
   const DeserializationError err = deserializeJson(doc, http.getStream());
   http.end();
   if (err) {
-    Serial.printf("[geoip] JSON %s\n", err.c_str());
+    Log.printf("[geoip] JSON %s\n", err.c_str());
     return false;
   }
 
   // The free tier reports rate limiting (45 req/min) in the body with HTTP 200,
   // not as an error status.
   if (strcmp(doc["status"] | "", "success") != 0) {
-    Serial.printf("[geoip] lookup failed: %s\n", doc["message"] | "unknown");
+    Log.printf("[geoip] lookup failed: %s\n", doc["message"] | "unknown");
     return false;
   }
 
@@ -61,7 +62,7 @@ bool fetchIpLocation(GeoResult *out) {
   const double lon = doc["lon"] | NAN;
   if (isnan(lat) || isnan(lon) || fabs(lat) > 90.0 || fabs(lon) > 180.0 ||
       (lat == 0.0 && lon == 0.0)) {
-    Serial.println("[geoip] implausible coordinates, ignoring");
+    Log.println("[geoip] implausible coordinates, ignoring");
     return false;
   }
 
@@ -73,6 +74,6 @@ bool fetchIpLocation(GeoResult *out) {
   sanitizeAscii(out->country);
   out->ok = true;
 
-  Serial.printf("[geoip] %s, %s  %.4f, %.4f\n", out->city, out->country, out->lat, out->lon);
+  Log.printf("[geoip] %s, %s  %.4f, %.4f\n", out->city, out->country, out->lat, out->lon);
   return true;
 }

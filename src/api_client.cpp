@@ -1,4 +1,5 @@
 #include "api_client.hpp"
+#include "log.hpp"
 
 #include "geo.hpp"
 #include "text_util.hpp"
@@ -48,10 +49,10 @@ bool fetchNearbyAircraft(float homeLat, float homeLon, int radiusNm,
            "https://opendata.adsb.fi/api/v3/lat/%.4f/lon/%.4f/dist/%d",
            homeLat, homeLon, radiusNm);
 
-  Serial.printf("[adsb.fi] GET %s\n", url);
+  Log.printf("[adsb.fi] GET %s\n", url);
 
   if (!http.begin(client, url)) {
-    Serial.println("[adsb.fi] begin failed");
+    Log.println("[adsb.fi] begin failed");
     return false;
   }
 
@@ -59,7 +60,7 @@ bool fetchNearbyAircraft(float homeLat, float homeLon, int radiusNm,
   http.setTimeout(kHttpTimeoutMs);
   const int httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK) {
-    Serial.printf("[adsb.fi] HTTP %d\n", httpCode);
+    Log.printf("[adsb.fi] HTTP %d\n", httpCode);
     http.end();
     return false;
   }
@@ -81,13 +82,13 @@ bool fetchNearbyAircraft(float homeLat, float homeLon, int radiusNm,
   http.end();
 
   if (err) {
-    Serial.printf("[adsb.fi] JSON %s\n", err.c_str());
+    Log.printf("[adsb.fi] JSON %s\n", err.c_str());
     return false;
   }
 
   JsonArray aircraft = doc["ac"].as<JsonArray>();
   if (aircraft.isNull()) {
-    Serial.println("[adsb.fi] No ac array");
+    Log.println("[adsb.fi] No ac array");
     return true;
   }
 
@@ -170,7 +171,7 @@ bool fetchNearbyAircraft(float homeLat, float homeLon, int radiusNm,
   }
 
   *outCount = count;
-  Serial.printf("[adsb.fi] Parsed %u aircraft\n", static_cast<unsigned>(count));
+  Log.printf("[adsb.fi] Parsed %u aircraft\n", static_cast<unsigned>(count));
   return true;
 }
 
@@ -185,7 +186,7 @@ bool fetchAircraftDetails(Aircraft &aircraft) {
 
   char url[80];
   snprintf(url, sizeof(url), "https://hexdb.io/api/v1/aircraft/%s", aircraft.hex);
-  Serial.printf("[hexdb] Aircraft %s\n", url);
+  Log.printf("[hexdb] Aircraft %s\n", url);
 
   if (!http.begin(client, url)) {
     return false;
@@ -194,7 +195,7 @@ bool fetchAircraftDetails(Aircraft &aircraft) {
   http.setTimeout(kHttpTimeoutMs);
   const int httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK) {
-    Serial.printf("[hexdb] Aircraft HTTP %d\n", httpCode);
+    Log.printf("[hexdb] Aircraft HTTP %d\n", httpCode);
     http.end();
     return false;
   }
@@ -203,7 +204,7 @@ bool fetchAircraftDetails(Aircraft &aircraft) {
   DeserializationError err = deserializeJson(doc, http.getStream());
   http.end();
   if (err) {
-    Serial.printf("[hexdb] Aircraft JSON %s\n", err.c_str());
+    Log.printf("[hexdb] Aircraft JSON %s\n", err.c_str());
     return false;
   }
 
@@ -273,7 +274,7 @@ bool fetchRouteInfo(Aircraft &aircraft) {
 
     char url[96];
     snprintf(url, sizeof(url), "https://hexdb.io/api/v1/route/icao/%s", aircraft.callsign);
-    Serial.printf("[hexdb] Route %s\n", url);
+    Log.printf("[hexdb] Route %s\n", url);
 
     if (!http.begin(client, url)) {
       return false;
@@ -281,7 +282,7 @@ bool fetchRouteInfo(Aircraft &aircraft) {
     http.setTimeout(kHttpTimeoutMs);
     const int httpCode = http.GET();
     if (httpCode != HTTP_CODE_OK) {
-      Serial.printf("[hexdb] Route HTTP %d\n", httpCode);
+      Log.printf("[hexdb] Route HTTP %d\n", httpCode);
       http.end();
       return false;
     }

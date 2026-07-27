@@ -1,4 +1,5 @@
 #include "crowpanel_display.hpp"
+#include "log.hpp"
 
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
@@ -27,7 +28,7 @@ constexpr int kBacklightPin = 2;
 bool CrowPanelDisplay::init() {
   s_vsyncSem = xSemaphoreCreateBinary();
   if (s_vsyncSem == nullptr) {
-    Serial.println("[lcd] vsync sem alloc failed");
+    Log.println("[lcd] vsync sem alloc failed");
     return false;
   }
 
@@ -72,12 +73,12 @@ bool CrowPanelDisplay::init() {
   if (err != ESP_OK && cfg.bounce_buffer_size_px != 0) {
     // Some IDF builds reject bounce buffers combined with a double framebuffer.
     // Fall back to double-FB without bounce (tear-free, may flicker).
-    Serial.println("[lcd] bounce+double-FB rejected; retrying without bounce");
+    Log.println("[lcd] bounce+double-FB rejected; retrying without bounce");
     cfg.bounce_buffer_size_px = 0;
     err = esp_lcd_new_rgb_panel(&cfg, &panel_);
   }
   if (err != ESP_OK) {
-    Serial.println("[lcd] esp_lcd_new_rgb_panel failed");
+    Log.println("[lcd] esp_lcd_new_rgb_panel failed");
     return false;
   }
 
@@ -87,12 +88,12 @@ bool CrowPanelDisplay::init() {
 
   if (esp_lcd_panel_reset(panel_) != ESP_OK ||
       esp_lcd_panel_init(panel_) != ESP_OK) {
-    Serial.println("[lcd] panel reset/init failed");
+    Log.println("[lcd] panel reset/init failed");
     return false;
   }
 
   if (esp_lcd_rgb_panel_get_frame_buffer(panel_, 2, &fb0_, &fb1_) != ESP_OK) {
-    Serial.println("[lcd] get_frame_buffer failed");
+    Log.println("[lcd] get_frame_buffer failed");
     return false;
   }
 

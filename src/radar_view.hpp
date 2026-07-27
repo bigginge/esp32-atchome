@@ -1,12 +1,14 @@
 #pragma once
 
 #include "aircraft.hpp"
+#include "theme.hpp"
 
 #include <lvgl.h>
 
 class RadarView {
  public:
-  static constexpr int32_t kSize = 480;
+  static constexpr int32_t kSize = theme::layout::kRadarSize;
+  static constexpr int kRings = 4;
 
   bool create(lv_obj_t *parent, float rangeNm);
   void setRangeNm(float rangeNm);
@@ -21,10 +23,22 @@ class RadarView {
    *  east/north nm from home and clears the pending flag. */
   bool consumePendingClick(float *eastNm, float *northNm);
 
+  /** Force the next redraw to repaint the whole view. Needed whenever
+   *  something outside the moving parts changed: new data (trails grow), a
+   *  range change, or the first paint. Ordinary frames only invalidate the
+   *  symbols and labels, which is the point -- between fetches an aircraft
+   *  moves about a pixel a second, so almost nothing needs repainting. */
+  void markFullRepaint() { fullRepaint_ = true; }
+
+  /** New positions arrived, so the trails grew. Cheaper than a full repaint:
+   *  only the trail extents need restoring, not the whole view. A full repaint
+   *  here cost ~200 ms and landed every 5 seconds, on every fetch. */
+  void markDataChanged() { trailsChanged_ = true; }
+
  private:
-  /** The canvas is 480x480, so int16 is ample. Half the size of lv_area_t,
-   *  which matters because RadarView is a global and these land in .bss —
-   *  internal SRAM, the scarce resource here. */
+  /** The canvas is a few hundred px square, so int16 is ample. Half the size of
+   *  lv_area_t, which matters because RadarView is a global and these land in
+   *  .bss — internal SRAM, the scarce resource here. */
   struct Rect {
     int16_t x1, y1, x2, y2;
   };
@@ -35,6 +49,7 @@ class RadarView {
     int32_t x, y;     // symbol centre
     int16_t symbolR;  // half-extent of the symbol's bounding box
     bool selected;
+    Rect box;  // symbol + trail extent, for dirty tracking and clip culling
   };
 
   /** Last frame's label placement, so a label that is still free keeps its
@@ -44,27 +59,77 @@ class RadarView {
     uint8_t form, anchor;
   };
 
+  /** A label the solver placed, resolved to pixels and ready to paint.
+   *
+   *  The anchor search is global -- it depends on every symbol and every label
+   *  already placed -- so it must run exactly once per frame. Painting, by
+   *  contrast, runs once per invalidated region. Keeping the solved result here
+   *  is what lets the two run at different rates. */
+  struct LabelPlacement {
+    Rect rect;
+    char text[24];
+    int16_t leadX1, leadY1, leadX2, leadY2;
+    uint8_t orderIdx;  // index into order_, for colour and selection
+    bool hasLeader;
+  };
+
   static constexpr size_t kAnchorCount = 12;
   static constexpr size_t kLabelForms = 3;
-  static constexpr size_t kStaticBlockers = 6;  // legend + HOME + 4 ring labels
-  static constexpr size_t kMaxBlockers = kStaticBlockers + kMaxAircraft * 2;
+  // Sizing bound only: legend + HOME + kRings ring labels, with headroom for
+  // the chrome still to come. The count that drawLabels() indexes against is
+  // staticBlockerCount_, recorded by seedStaticBlockers() -- do not use this
+  // constant for that, or adding one blocker silently shifts every index.
+  static constexpr size_t kStaticBlockerCap = 12;
+  static constexpr size_t kMaxBlockers = kStaticBlockerCap + kMaxAircraft * 2;
 
   static void onClicked(lv_event_t *e);
+  static void onDraw(lv_event_t *e);
+  static void onCoverCheck(lv_event_t *e);
+
+  /** Rasterise the static chrome into bgCache_. Uses a transient hidden
+   *  lv_canvas -- the only public route to drawing into an arbitrary buffer.
+   *  Runs at create and whenever the range changes, never per frame. */
+  void renderBackgroundCache();
+  /** Paint straight into the display's layer, i.e. the framebuffer. */
+  void paintDirect(lv_layer_t *layer);
+
+  /** Rects this frame touches: symbol boxes, label boxes and leader lines. */
+  void collectDirty();
+  /** Invalidate last frame's rects and this frame's, so the old pixels are
+   *  restored from the background cache and the new ones drawn. */
+  void invalidateDirty();
+  /** True if `r` (local coords) lies outside the region being painted. LVGL
+   *  calls the draw handler once per invalidated region, so without this every
+   *  region would build draw tasks for every aircraft on screen. */
+  bool culled(const Rect &r) const;
 
   void drawBackground(lv_layer_t *layer);
   void drawLegend(lv_layer_t *layer);
+  /** Radius in px of range ring `i` (1..kRings). */
+  int32_t ringRadius(int i) const;
+  /** Box occupied by ring `i`'s nm caption. drawBackground() draws the text and
+   *  seedStaticBlockers() reserves the space; both must agree, so both call
+   *  this rather than repeating the placement maths. */
+  Rect ringLabelRect(int i) const;
   void nmToPixel(float eastNm, float northNm, int32_t *x, int32_t *y) const;
   void pixelToNm(int32_t x, int32_t y, float *eastNm, float *northNm) const;
   lv_color_t colorForAircraft(const Aircraft &ac) const;
   lv_opa_t trailOpacity(const Aircraft &ac, uint8_t ageIndex, uint8_t count,
                         bool selected) const;
 
+  /** Everything that affects a pixel: positions, altitude (colour), selection.
+   *  Compared against the last painted frame to decide whether to paint at
+   *  all. Cheap to compute -- it runs over order_, which buildDrawOrder() has
+   *  just filled in. */
+  uint32_t paintSignature() const;
+
   void buildDrawOrder();
   void seedStaticBlockers();
   uint8_t trailBudget(bool selected) const;
   void drawTrail(lv_layer_t *layer, const Placed &p);
   void drawSymbol(lv_layer_t *layer, const Placed &p);
-  void drawLabels(lv_layer_t *layer);
+  void layoutLabels();
+  void paintLabels(lv_layer_t *layer);
   bool anchorRect(const Placed &p, uint8_t anchor, int32_t w, int32_t h,
                   Rect *out) const;
   bool blocked(const Rect &r, size_t skip) const;
@@ -73,8 +138,18 @@ class RadarView {
   static bool rectsOverlap(const Rect &a, const Rect &b);
   static void formatLabel(const Aircraft &ac, uint8_t form, char *buf, size_t n);
 
-  lv_obj_t *canvas_ = nullptr;
-  uint8_t *buf_ = nullptr;
+  lv_obj_t *obj_ = nullptr;
+  // The static chrome, rasterised once. Painted per frame with lv_draw_image,
+  // which takes the same per-row memcpy fast path as the old canvas blit but
+  // only for the clipped region -- that is the whole point of the change.
+  uint8_t *bgCache_ = nullptr;
+  lv_image_dsc_t bgImg_ = {};
+  bool bgValid_ = false;
+  // Screen-absolute origin of the view. Drawing now goes into the display's
+  // layer rather than a canvas of our own, so every local coordinate needs it.
+  // Zero while rendering the cache, which is in local coordinates.
+  int32_t ox_ = 0;
+  int32_t oy_ = 0;
   float rangeNm_ = 25.0f;
   float pxPerNm_ = 1.0f;
 
@@ -87,9 +162,30 @@ class RadarView {
   size_t orderCount_ = 0;
   Rect blockers_[kMaxBlockers];
   size_t blockerCount_ = 0;
+  size_t staticBlockerCount_ = 0;  // set by seedStaticBlockers()
   float trailScale_ = 1.0f;
   AnchorMemo memo_[kMaxAircraft];
   size_t memoCount_ = 0;
+  LabelPlacement labels_[kMaxAircraft];
+  size_t labelCount_ = 0;
+
+  // Symbol box + label box per aircraft, this frame and last.
+  static constexpr size_t kMaxDirty = kMaxAircraft * 2;
+  // How many separate invalid areas to hand LVGL. Each costs a full draw pass
+  // with a fixed overhead of ~5 ms on top of its area-proportional cost, so
+  // this trades clipping tightness against pass count. Measured at 6-7
+  // aircraft: 2 regions => 8.0 fps, 4 => 11.6 fps, 8 => 9.9 fps.
+  static constexpr size_t kMaxRegions = 4;
+  Rect dirty_[kMaxDirty];
+  size_t dirtyCount_ = 0;
+  Rect prevDirty_[kMaxDirty];
+  size_t prevDirtyCount_ = 0;
+  bool fullRepaint_ = true;
+  bool trailsChanged_ = false;
+  uint32_t lastPaintSig_ = 0;
+  bool hasPainted_ = false;
+  // The region currently being painted, in local coordinates.
+  Rect clip_ = {0, 0, 0, 0};
 
   volatile bool pendingClick_ = false;
   float pendingEast_ = 0.0f;

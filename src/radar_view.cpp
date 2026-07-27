@@ -1,4 +1,7 @@
 #include "radar_view.hpp"
+#include "log.hpp"
+
+#include "frame_probe.hpp"
 
 #include <esp_heap_caps.h>
 #include <math.h>
@@ -7,7 +10,27 @@
 
 namespace {
 
-constexpr uint32_t kBgColor = 0x0B1218;
+/** Geometry of the altitude legend.
+ *
+ *  drawLegend() paints the backdrop and seedStaticBlockers() reserves the same
+ *  box so no aircraft label is placed underneath it (the legend draws last and
+ *  would paint over one). Those two rects used to be written out separately,
+ *  held together by nothing but a comment. One struct, two readers. */
+struct LegendGeom {
+  int32_t barX, barW;      // gradient bar
+  int32_t barTop, barBot;  // gradient extent
+  int32_t x1, y1, x2, y2;  // backdrop == the label blocker
+};
+
+constexpr LegendGeom kLegend = [] {
+  constexpr int32_t barW = 8;
+  constexpr int32_t top = 46;
+  constexpr int32_t bot = 206;
+  return LegendGeom{RadarView::kSize - 16, barW,
+                    top,                   bot,
+                    RadarView::kSize - 48, top - 20,
+                    RadarView::kSize - 2,  bot + 6};
+}();
 
 // Draw a text label straight onto the canvas layer. LVGL only duplicates the
 // text when text_local is set, so we set it and let LVGL copy — that keeps a
@@ -32,7 +55,7 @@ void drawText(lv_layer_t *layer, int32_t x, int32_t y, int32_t w,
 
 lv_color_t altitudeColor(int altitudeFt) {
   if (altitudeFt <= 0) {
-    return lv_color_hex(0x8A9AAA);  // ground / unknown
+    return theme::c(theme::kGround);
   }
   const float n = altitudeNorm(altitudeFt);
   // Monotonic hue sweep, green-cyan (low) → magenta (high).
@@ -43,29 +66,95 @@ lv_color_t altitudeColor(int altitudeFt) {
 bool RadarView::create(lv_obj_t *parent, float rangeNm) {
   setRangeNm(rangeNm);
 
-  const size_t bufBytes =
-      static_cast<size_t>(kSize) * static_cast<size_t>(kSize) * sizeof(uint16_t);
-  buf_ = static_cast<uint8_t *>(
+  const uint32_t stride = lv_draw_buf_width_to_stride(kSize, LV_COLOR_FORMAT_RGB565);
+  const size_t bufBytes = static_cast<size_t>(stride) * static_cast<size_t>(kSize);
+  bgCache_ = static_cast<uint8_t *>(
       heap_caps_malloc(bufBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (buf_ == nullptr) {
-    Serial.println("[radar] Failed to allocate canvas buffer in PSRAM");
+  if (bgCache_ == nullptr) {
+    Log.println("[radar] Failed to allocate background cache in PSRAM");
     return false;
   }
 
-  canvas_ = lv_canvas_create(parent);
-  lv_obj_set_size(canvas_, kSize, kSize);
-  lv_obj_set_pos(canvas_, 0, 0);
-  lv_canvas_set_buffer(canvas_, buf_, kSize, kSize, LV_COLOR_FORMAT_RGB565);
-  lv_obj_add_flag(canvas_, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(canvas_, onClicked, LV_EVENT_CLICKED, this);
+  bgImg_.header.magic = LV_IMAGE_HEADER_MAGIC;
+  bgImg_.header.cf = LV_COLOR_FORMAT_RGB565;
+  bgImg_.header.flags = 0;
+  bgImg_.header.w = kSize;
+  bgImg_.header.h = kSize;
+  bgImg_.header.stride = stride;
+  bgImg_.data = bgCache_;
+  bgImg_.data_size = bufBytes;
 
+  // A plain object, not a canvas: we paint it ourselves in LV_EVENT_DRAW_MAIN,
+  // straight into the display's layer. That removes both the per-frame canvas
+  // clear and the canvas -> framebuffer blit, which together were ~106 ms of a
+  // ~200 ms frame. remove_style_all also drops the theme's background, so LVGL
+  // does not fill the rect before we paint over it.
+  obj_ = lv_obj_create(parent);
+  lv_obj_remove_style_all(obj_);
+  lv_obj_set_size(obj_, kSize, kSize);
+  lv_obj_set_pos(obj_, theme::layout::kRadarX, theme::layout::kRadarY);
+  lv_obj_clear_flag(obj_, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(obj_, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(obj_, onClicked, LV_EVENT_CLICKED, this);
+  lv_obj_add_event_cb(obj_, onDraw, LV_EVENT_DRAW_MAIN, this);
+  lv_obj_add_event_cb(obj_, onCoverCheck, LV_EVENT_COVER_CHECK, this);
+
+  renderBackgroundCache();
   redraw();
   return true;
 }
 
 void RadarView::setRangeNm(float rangeNm) {
-  rangeNm_ = rangeNm > 1.0f ? rangeNm : 1.0f;
+  const float clamped = rangeNm > 1.0f ? rangeNm : 1.0f;
+  if (clamped == rangeNm_ && bgValid_) {
+    return;  // a save that did not touch the radius costs nothing
+  }
+  rangeNm_ = clamped;
   pxPerNm_ = static_cast<float>(kSize / 2 - 8) / rangeNm_;
+  // Ring radii and their nm captions are baked into the cache.
+  bgValid_ = false;
+}
+
+void RadarView::renderBackgroundCache() {
+  if (bgCache_ == nullptr || obj_ == nullptr) {
+    return;
+  }
+  // lv_canvas is the only public way to rasterise into a buffer we own. This
+  // one is transient and hidden: lv_canvas_finish_layer() drives the draw
+  // dispatch from the layer's own task list regardless of visibility, and its
+  // trailing lv_obj_invalidate() is a no-op while hidden, so nothing of this
+  // ever reaches the screen.
+  lv_obj_t *scratch = lv_canvas_create(lv_obj_get_parent(obj_));
+  lv_obj_add_flag(scratch, LV_OBJ_FLAG_HIDDEN);
+  lv_canvas_set_buffer(scratch, bgCache_, kSize, kSize, LV_COLOR_FORMAT_RGB565);
+  // Fill with the *page* colour, then lay a rounded rect of the radar colour on
+  // top. The corners end up painted with the page colour, so the view reads as
+  // a rounded card while remaining a fully opaque rectangle -- which is what
+  // keeps the LV_EVENT_COVER_CHECK claim honest and stops LVGL filling the
+  // screen background underneath every frame.
+  lv_canvas_fill_bg(scratch, theme::c(theme::kBgApp), LV_OPA_COVER);
+
+  lv_layer_t layer;
+  lv_canvas_init_layer(scratch, &layer);
+  ox_ = 0;  // the cache is in local coordinates
+  oy_ = 0;
+
+  lv_draw_rect_dsc_t card;
+  lv_draw_rect_dsc_init(&card);
+  card.bg_color = theme::c(theme::kRadarBg);
+  card.bg_opa = LV_OPA_COVER;
+  card.radius = theme::kRadLg;
+  card.border_color = theme::c(theme::kBorder);
+  card.border_width = 1;
+  card.border_opa = LV_OPA_60;
+  lv_area_t full = {0, 0, kSize - 1, kSize - 1};
+  lv_draw_rect(&layer, &card, &full);
+
+  drawBackground(&layer);
+  lv_canvas_finish_layer(scratch, &layer);
+
+  lv_obj_delete(scratch);
+  bgValid_ = true;
 }
 
 void RadarView::setSnapshot(const Aircraft *list, size_t count,
@@ -153,6 +242,21 @@ void RadarView::buildDrawOrder() {
     // Glyph nose reaches 9 px; selected scales x1.35 and adds a 15 px halo.
     p.symbolR = p.selected ? 18 : 10;
 
+    // Extent of everything this aircraft paints. +2 covers the glyph casing,
+    // which is drawn two pixels wider than the core stroke.
+    const int16_t r = static_cast<int16_t>(p.symbolR + 2);
+    p.box = {static_cast<int16_t>(x - r), static_cast<int16_t>(y - r),
+             static_cast<int16_t>(x + r), static_cast<int16_t>(y + r)};
+    const uint8_t used = ac.trailCount < kTrailLen ? ac.trailCount : kTrailLen;
+    for (uint8_t t = 0; t < used; ++t) {
+      int32_t tx = 0, ty = 0;
+      nmToPixel(ac.trail[t].eastNm, ac.trail[t].northNm, &tx, &ty);
+      if (tx - 1 < p.box.x1) p.box.x1 = static_cast<int16_t>(tx - 1);
+      if (ty - 1 < p.box.y1) p.box.y1 = static_cast<int16_t>(ty - 1);
+      if (tx + 1 > p.box.x2) p.box.x2 = static_cast<int16_t>(tx + 1);
+      if (ty + 1 > p.box.y2) p.box.y2 = static_cast<int16_t>(ty + 1);
+    }
+
     // Insertion sort by altitude ascending, so high aircraft draw last and
     // paint over low ones — looking down from above, higher is nearer the eye.
     // The selection is forced to the tail so its halo is never overpainted.
@@ -192,13 +296,28 @@ void RadarView::buildDrawOrder() {
                                     : 0.50f;
 }
 
+int32_t RadarView::ringRadius(int i) const {
+  const float nm = rangeNm_ * (static_cast<float>(i) / static_cast<float>(kRings));
+  return static_cast<int32_t>(lroundf(nm * pxPerNm_));
+}
+
+RadarView::Rect RadarView::ringLabelRect(int i) const {
+  const int32_t cx = kSize / 2;
+  const int32_t ly = kSize / 2 - ringRadius(i) - 1;
+  return {static_cast<int16_t>(cx + 5), static_cast<int16_t>(ly),
+          static_cast<int16_t>(cx + 19), static_cast<int16_t>(ly + 17)};
+}
+
+// Local coordinates throughout: this is only ever rasterised into bgCache_ by
+// renderBackgroundCache(), never into the display layer, so it needs no origin
+// offset. Everything below that paints live does.
 void RadarView::drawBackground(lv_layer_t *layer) {
   const int32_t cx = kSize / 2;
   const int32_t cy = kSize / 2;
-  const lv_color_t ringColor = lv_color_hex(0x2A3A4A);
-  const lv_color_t crossColor = lv_color_hex(0x1E2A36);
-  const lv_color_t labelColor = lv_color_hex(0x5A6A7A);
-  const lv_color_t compassColor = lv_color_hex(0x8A9AAA);
+  const lv_color_t ringColor = theme::c(theme::kRing);
+  const lv_color_t crossColor = theme::c(theme::kCross);
+  const lv_color_t labelColor = theme::c(theme::kRingLabel);
+  const lv_color_t compassColor = theme::c(theme::kCompass);
 
   lv_draw_line_dsc_t line;
   lv_draw_line_dsc_init(&line);
@@ -226,42 +345,42 @@ void RadarView::drawBackground(lv_layer_t *layer) {
   arc.start_angle = 0;
   arc.end_angle = 360;
 
-  const int rings = 4;
-  for (int i = 1; i <= rings; ++i) {
-    const float nm = rangeNm_ * (static_cast<float>(i) / static_cast<float>(rings));
-    const int32_t radius = static_cast<int32_t>(lroundf(nm * pxPerNm_));
+  for (int i = 1; i <= kRings; ++i) {
+    const int32_t radius = ringRadius(i);
     arc.center.x = cx;
     arc.center.y = cy;
     arc.radius = static_cast<int16_t>(radius);
     lv_draw_arc(layer, &arc);
 
     // Ring range label, just above the ring on the vertical axis.
+    const float nm = rangeNm_ * (static_cast<float>(i) / static_cast<float>(kRings));
+    const Rect box = ringLabelRect(i);
     char nmBuf[8];
     snprintf(nmBuf, sizeof(nmBuf), "%d", static_cast<int>(lroundf(nm)));
-    drawText(layer, cx + 5, cy - radius - 1, 40, nmBuf, labelColor, LV_OPA_COVER,
-             &lv_font_montserrat_14, LV_TEXT_ALIGN_LEFT);
+    drawText(layer, box.x1, box.y1, 40, nmBuf, labelColor, LV_OPA_COVER,
+             theme::fontRadar(), LV_TEXT_ALIGN_LEFT);
   }
 
   // Compass markers.
   drawText(layer, cx - 16, 3, 32, "N", compassColor, LV_OPA_COVER,
-           &lv_font_montserrat_16, LV_TEXT_ALIGN_CENTER);
+           theme::fontBody(), LV_TEXT_ALIGN_CENTER);
   drawText(layer, cx - 16, kSize - 22, 32, "S", compassColor, LV_OPA_COVER,
-           &lv_font_montserrat_16, LV_TEXT_ALIGN_CENTER);
+           theme::fontBody(), LV_TEXT_ALIGN_CENTER);
   drawText(layer, kSize - 22, cy - 10, 20, "E", compassColor, LV_OPA_COVER,
-           &lv_font_montserrat_16, LV_TEXT_ALIGN_CENTER);
+           theme::fontBody(), LV_TEXT_ALIGN_CENTER);
   drawText(layer, 2, cy - 10, 20, "W", compassColor, LV_OPA_COVER,
-           &lv_font_montserrat_16, LV_TEXT_ALIGN_CENTER);
+           theme::fontBody(), LV_TEXT_ALIGN_CENTER);
 
   // Home marker + label.
   lv_draw_rect_dsc_t home;
   lv_draw_rect_dsc_init(&home);
-  home.bg_color = lv_color_hex(0xC8D0D8);
+  home.bg_color = theme::c(theme::kHomeDot);
   home.bg_opa = LV_OPA_COVER;
   home.radius = LV_RADIUS_CIRCLE;
   lv_area_t homeArea = {cx - 3, cy - 3, cx + 3, cy + 3};
   lv_draw_rect(layer, &home, &homeArea);
-  drawText(layer, cx - 24, cy + 6, 48, "HOME", lv_color_hex(0x9AAAB8),
-           LV_OPA_COVER, &lv_font_montserrat_14, LV_TEXT_ALIGN_CENTER);
+  drawText(layer, cx - 24, cy + 6, 48, "HOME", theme::c(theme::kHomeCaption),
+           LV_OPA_COVER, theme::fontRadar(), LV_TEXT_ALIGN_CENTER);
 }
 
 void RadarView::drawTrail(lv_layer_t *layer, const Placed &p) {
@@ -289,10 +408,10 @@ void RadarView::drawTrail(lv_layer_t *layer, const Placed &p) {
     nmToPixel(ac.trail[idx0].eastNm, ac.trail[idx0].northNm, &x0, &y0);
     nmToPixel(ac.trail[idx1].eastNm, ac.trail[idx1].northNm, &x1, &y1);
     trail.opa = trailOpacity(ac, i, used, p.selected);
-    trail.p1.x = x0;
-    trail.p1.y = y0;
-    trail.p2.x = x1;
-    trail.p2.y = y1;
+    trail.p1.x = x0 + ox_;
+    trail.p1.y = y0 + oy_;
+    trail.p2.x = x1 + ox_;
+    trail.p2.y = y1 + oy_;
     lv_draw_line(layer, &trail);
   }
 }
@@ -300,8 +419,8 @@ void RadarView::drawTrail(lv_layer_t *layer, const Placed &p) {
 void RadarView::drawSymbol(lv_layer_t *layer, const Placed &p) {
   const Aircraft &ac = *p.ac;
   const lv_color_t color = colorForAircraft(ac);
-  const int32_t x = p.x;
-  const int32_t y = p.y;
+  const int32_t x = p.x + ox_;
+  const int32_t y = p.y + oy_;
 
   const float rad = (ac.trackDeg - 90.0f) * static_cast<float>(DEG_TO_RAD);
   const float fx = cosf(rad);
@@ -312,7 +431,7 @@ void RadarView::drawSymbol(lv_layer_t *layer, const Placed &p) {
   if (p.selected) {
     lv_draw_arc_dsc_t halo;
     lv_draw_arc_dsc_init(&halo);
-    halo.color = lv_color_hex(0xFFFFFF);
+    halo.color = theme::c(theme::kSelection);
     halo.width = 2;
     halo.opa = LV_OPA_80;
     halo.center.x = x;
@@ -356,7 +475,7 @@ void RadarView::drawSymbol(lv_layer_t *layer, const Placed &p) {
     glyph.round_start = 1;
     glyph.round_end = 1;
     glyph.opa = LV_OPA_COVER;
-    glyph.color = pass == 0 ? lv_color_hex(kBgColor) : color;
+    glyph.color = pass == 0 ? theme::c(theme::kRadarBg) : color;
     glyph.width = pass == 0 ? coreW + 2 : coreW;
 
     for (const Seg &seg : segs) {
@@ -394,22 +513,22 @@ void RadarView::seedStaticBlockers() {
   const int32_t cx = kSize / 2;
   const int32_t cy = kSize / 2;
 
-  // The legend is drawn after the labels, so it would paint over any label
-  // that strayed under it. Must match drawLegend's backdrop rect.
-  addBlocker({kSize - 48, 26, kSize - 2, 212});
+  // The legend is drawn after the labels, so it would paint over any label that
+  // strayed under it.
+  addBlocker({static_cast<int16_t>(kLegend.x1), static_cast<int16_t>(kLegend.y1),
+              static_cast<int16_t>(kLegend.x2), static_cast<int16_t>(kLegend.y2)});
   // HOME marker plus its caption.
   addBlocker({static_cast<int16_t>(cx - 26), static_cast<int16_t>(cy - 8),
               static_cast<int16_t>(cx + 26), static_cast<int16_t>(cy + 24)});
 
   // Ring range labels sit in a column just right of the vertical axis.
-  const int rings = 4;
-  for (int i = 1; i <= rings; ++i) {
-    const float nm = rangeNm_ * (static_cast<float>(i) / static_cast<float>(rings));
-    const int32_t radius = static_cast<int32_t>(lroundf(nm * pxPerNm_));
-    const int32_t ly = cy - radius - 1;
-    addBlocker({static_cast<int16_t>(cx + 5), static_cast<int16_t>(ly),
-                static_cast<int16_t>(cx + 19), static_cast<int16_t>(ly + 17)});
+  for (int i = 1; i <= kRings; ++i) {
+    addBlocker(ringLabelRect(i));
   }
+
+  // drawLabels() identifies "the aircraft's own symbol" by index, so it needs
+  // to know where the static run ended rather than assuming a count.
+  staticBlockerCount_ = blockerCount_;
 }
 
 void RadarView::formatLabel(const Aircraft &ac, uint8_t form, char *buf, size_t n) {
@@ -491,7 +610,8 @@ uint8_t RadarView::rememberedAnchor(const char *hex, uint8_t *form) const {
   return 0xFF;
 }
 
-void RadarView::drawLabels(lv_layer_t *layer) {
+void RadarView::layoutLabels() {
+  labelCount_ = 0;
   seedStaticBlockers();
 
   // Every symbol blocks, including ones we have not placed a label for yet —
@@ -517,7 +637,7 @@ void RadarView::drawLabels(lv_layer_t *layer) {
   for (size_t k = 0; k < orderCount_; ++k) {
     const size_t idx = labelOrder_[k];
     const Placed &p = order_[idx];
-    const size_t ownSymbol = kStaticBlockers + idx;
+    const size_t ownSymbol = staticBlockerCount_ + idx;
 
     char lbl[24];
     Rect rect = {0, 0, 0, 0};
@@ -530,7 +650,7 @@ void RadarView::drawLabels(lv_layer_t *layer) {
     if (hintAnchor[idx] < kAnchorCount && hintForm[idx] < kLabelForms) {
       formatLabel(*p.ac, hintForm[idx], lbl, sizeof(lbl));
       lv_point_t sz;
-      lv_text_get_size(&sz, lbl, &lv_font_montserrat_14, 0, 0, LV_COORD_MAX,
+      lv_text_get_size(&sz, lbl, theme::fontRadar(), 0, 0, LV_COORD_MAX,
                        LV_TEXT_FLAG_NONE);
       if (anchorRect(p, hintAnchor[idx], sz.x, sz.y, &rect) && !blocked(rect, ownSymbol)) {
         placed = true;
@@ -545,7 +665,7 @@ void RadarView::drawLabels(lv_layer_t *layer) {
     for (uint8_t form = 0; !placed && form < kLabelForms; ++form) {
       formatLabel(*p.ac, form, lbl, sizeof(lbl));
       lv_point_t sz;
-      lv_text_get_size(&sz, lbl, &lv_font_montserrat_14, 0, 0, LV_COORD_MAX,
+      lv_text_get_size(&sz, lbl, theme::fontRadar(), 0, 0, LV_COORD_MAX,
                        LV_TEXT_FLAG_NONE);
       for (uint8_t a = 0; a < kAnchorCount; ++a) {
         if (anchorRect(p, a, sz.x, sz.y, &rect) && !blocked(rect, ownSymbol)) {
@@ -565,7 +685,7 @@ void RadarView::drawLabels(lv_layer_t *layer) {
       // so it stays readable even if it has to overlap something.
       formatLabel(*p.ac, 0, lbl, sizeof(lbl));
       lv_point_t sz;
-      lv_text_get_size(&sz, lbl, &lv_font_montserrat_14, 0, 0, LV_COORD_MAX,
+      lv_text_get_size(&sz, lbl, theme::fontRadar(), 0, 0, LV_COORD_MAX,
                        LV_TEXT_FLAG_NONE);
       const int32_t lx = p.x + 11;
       const int32_t ly = p.y - 8;
@@ -578,41 +698,35 @@ void RadarView::drawLabels(lv_layer_t *layer) {
       formatLabel(*p.ac, usedForm, lbl, sizeof(lbl));
     }
 
-    // A label on the outer ring of anchors has been pushed clear of its
-    // symbol, so tie it back with a leader line.
-    if (usedAnchor >= 8) {
-      int32_t tx = p.x < rect.x1 ? rect.x1 : (p.x > rect.x2 ? rect.x2 : p.x);
-      int32_t ty = p.y < rect.y1 ? rect.y1 : (p.y > rect.y2 ? rect.y2 : p.y);
-      const float dx = static_cast<float>(tx - p.x);
-      const float dy = static_cast<float>(ty - p.y);
-      const float len = sqrtf(dx * dx + dy * dy);
-      if (len > p.symbolR) {
-        lv_draw_line_dsc_t lead;
-        lv_draw_line_dsc_init(&lead);
-        lead.color = colorForAircraft(*p.ac);
-        lead.width = 1;
-        lead.opa = LV_OPA_50;
-        lead.p1.x = p.x + static_cast<int32_t>(lroundf(dx / len * p.symbolR));
-        lead.p1.y = p.y + static_cast<int32_t>(lroundf(dy / len * p.symbolR));
-        lead.p2.x = tx;
-        lead.p2.y = ty;
-        lv_draw_line(layer, &lead);
+    // Record the solved placement; painting happens later, possibly more than
+    // once, from labels_ alone.
+    if (labelCount_ < kMaxAircraft) {
+      LabelPlacement &lp = labels_[labelCount_++];
+      lp.rect = rect;
+      strncpy(lp.text, lbl, sizeof(lp.text) - 1);
+      lp.text[sizeof(lp.text) - 1] = '\0';
+      lp.orderIdx = static_cast<uint8_t>(idx);
+      lp.hasLeader = false;
+
+      // A label on the outer ring of anchors has been pushed clear of its
+      // symbol, so tie it back with a leader line.
+      if (usedAnchor >= 8) {
+        const int32_t tx = p.x < rect.x1 ? rect.x1 : (p.x > rect.x2 ? rect.x2 : p.x);
+        const int32_t ty = p.y < rect.y1 ? rect.y1 : (p.y > rect.y2 ? rect.y2 : p.y);
+        const float dx = static_cast<float>(tx - p.x);
+        const float dy = static_cast<float>(ty - p.y);
+        const float len = sqrtf(dx * dx + dy * dy);
+        if (len > p.symbolR) {
+          lp.hasLeader = true;
+          lp.leadX1 = static_cast<int16_t>(
+              p.x + static_cast<int32_t>(lroundf(dx / len * p.symbolR)));
+          lp.leadY1 = static_cast<int16_t>(
+              p.y + static_cast<int32_t>(lroundf(dy / len * p.symbolR)));
+          lp.leadX2 = static_cast<int16_t>(tx);
+          lp.leadY2 = static_cast<int16_t>(ty);
+        }
       }
     }
-
-    // Backdrop, so 14 px text stays readable over rings and trails —
-    // collision avoidance cannot help with those.
-    lv_draw_rect_dsc_t back;
-    lv_draw_rect_dsc_init(&back);
-    back.bg_color = lv_color_hex(kBgColor);
-    back.bg_opa = p.selected ? 210 : 165;
-    back.radius = 3;
-    lv_area_t backArea = {rect.x1, rect.y1, rect.x2, rect.y2};
-    lv_draw_rect(layer, &back, &backArea);
-
-    drawText(layer, rect.x1 + 3, rect.y1 + 1, rect.x2 - rect.x1 - 6, lbl,
-             p.selected ? lv_color_hex(0xFFFFFF) : lv_color_hex(0xD8E2EC),
-             LV_OPA_COVER, &lv_font_montserrat_14, LV_TEXT_ALIGN_LEFT);
 
     addBlocker(rect);
 
@@ -628,24 +742,164 @@ void RadarView::drawLabels(lv_layer_t *layer) {
   memoCount_ = written;
 }
 
-void RadarView::drawLegend(lv_layer_t *layer) {
-  const int32_t x0 = kSize - 16;
-  const int32_t barW = 8;
-  const int32_t yTop = 46;
-  const int32_t yBot = 206;
-  const int32_t height = yBot - yTop;
+uint32_t RadarView::paintSignature() const {
+  uint32_t h = 2166136261u ^ static_cast<uint32_t>(orderCount_);
+  for (size_t i = 0; i < orderCount_; ++i) {
+    const Placed &p = order_[i];
+    h = (h * 16777619u) ^ static_cast<uint32_t>(p.x);
+    h = (h * 16777619u) ^ static_cast<uint32_t>(p.y);
+    h = (h * 16777619u) ^ static_cast<uint32_t>(p.ac->altitudeFt);
+    h = (h * 16777619u) ^ static_cast<uint32_t>(p.selected ? 1 : 0);
+  }
+  return h;
+}
 
-  // Backdrop for legibility.
+bool RadarView::culled(const Rect &r) const {
+  return r.x2 < clip_.x1 || clip_.x2 < r.x1 || r.y2 < clip_.y1 || clip_.y2 < r.y1;
+}
+
+void RadarView::collectDirty() {
+  dirtyCount_ = 0;
+
+  // Symbol boxes only in the common case: trails do not move between fetches,
+  // and a trail's extent is large enough that including it every frame would
+  // invalidate most of the view. On the frames where new positions arrived the
+  // trails did grow, so those frames use the full per-aircraft extent instead.
+  for (size_t i = 0; i < orderCount_ && dirtyCount_ < kMaxDirty; ++i) {
+    const Placed &p = order_[i];
+    if (trailsChanged_) {
+      dirty_[dirtyCount_++] = p.box;
+    } else {
+      const int16_t r = static_cast<int16_t>(p.symbolR + 2);
+      dirty_[dirtyCount_++] = {static_cast<int16_t>(p.x - r), static_cast<int16_t>(p.y - r),
+                               static_cast<int16_t>(p.x + r), static_cast<int16_t>(p.y + r)};
+    }
+  }
+
+  for (size_t i = 0; i < labelCount_ && dirtyCount_ < kMaxDirty; ++i) {
+    const LabelPlacement &lp = labels_[i];
+    Rect r = lp.rect;
+    if (lp.hasLeader) {
+      // The leader runs from the symbol to the label, through pixels neither
+      // rect covers.
+      if (lp.leadX1 < r.x1) r.x1 = lp.leadX1;
+      if (lp.leadY1 < r.y1) r.y1 = lp.leadY1;
+      if (lp.leadX1 > r.x2) r.x2 = lp.leadX1;
+      if (lp.leadY1 > r.y2) r.y2 = lp.leadY1;
+    }
+    dirty_[dirtyCount_++] = r;
+  }
+}
+
+void RadarView::invalidateDirty() {
+  lv_area_t coords;
+  lv_obj_get_coords(obj_, &coords);
+
+  // Both sets: last frame's rects to restore the background under where things
+  // were, this frame's to draw where they now are.
+  Rect region[kMaxDirty * 2];
+  size_t n = 0;
+  for (size_t i = 0; i < prevDirtyCount_; ++i) region[n++] = prevDirty_[i];
+  for (size_t i = 0; i < dirtyCount_; ++i) region[n++] = dirty_[i];
+  if (n == 0) {
+    return;
+  }
+
+  // Merge down to a handful of regions before invalidating. LVGL renders each
+  // invalid area as its own pass, and each pass re-runs the whole draw handler
+  // -- including setting up the background image draw. Measured at ~5-8 ms per
+  // pass, so two dozen tight rects cost far more than a few loose ones: going
+  // from 24 regions to 4 was worth more than the tighter clipping it gave up.
+  auto area = [](const Rect &r) -> int32_t {
+    return (static_cast<int32_t>(r.x2) - r.x1 + 1) * (static_cast<int32_t>(r.y2) - r.y1 + 1);
+  };
+  auto merged = [](const Rect &a, const Rect &b) -> Rect {
+    return {a.x1 < b.x1 ? a.x1 : b.x1, a.y1 < b.y1 ? a.y1 : b.y1,
+            a.x2 > b.x2 ? a.x2 : b.x2, a.y2 > b.y2 ? a.y2 : b.y2};
+  };
+
+  while (n > kMaxRegions) {
+    // Cheapest pair to merge: the one adding least dead area.
+    size_t bi = 0, bj = 1;
+    int32_t best = INT32_MAX;
+    for (size_t i = 0; i < n; ++i) {
+      for (size_t j = i + 1; j < n; ++j) {
+        const int32_t cost = area(merged(region[i], region[j])) - area(region[i]) -
+                             area(region[j]);
+        if (cost < best) {
+          best = cost;
+          bi = i;
+          bj = j;
+        }
+      }
+    }
+    region[bi] = merged(region[bi], region[bj]);
+    region[bj] = region[--n];
+  }
+
+  for (size_t i = 0; i < n; ++i) {
+    lv_area_t a = {region[i].x1 + coords.x1 - 1, region[i].y1 + coords.y1 - 1,
+                   region[i].x2 + coords.x1 + 1, region[i].y2 + coords.y1 + 1};
+    lv_obj_invalidate_area(obj_, &a);
+  }
+}
+
+void RadarView::paintLabels(lv_layer_t *layer) {
+  for (size_t i = 0; i < labelCount_; ++i) {
+    const LabelPlacement &lp = labels_[i];
+    if (culled(lp.rect) && !(lp.hasLeader && !culled(order_[lp.orderIdx].box))) {
+      continue;
+    }
+    const Placed &p = order_[lp.orderIdx];
+
+    if (lp.hasLeader) {
+      lv_draw_line_dsc_t lead;
+      lv_draw_line_dsc_init(&lead);
+      lead.color = colorForAircraft(*p.ac);
+      lead.width = 1;
+      lead.opa = LV_OPA_50;
+      lead.p1.x = lp.leadX1 + ox_;
+      lead.p1.y = lp.leadY1 + oy_;
+      lead.p2.x = lp.leadX2 + ox_;
+      lead.p2.y = lp.leadY2 + oy_;
+      lv_draw_line(layer, &lead);
+    }
+
+    // Backdrop, so 14 px text stays readable over rings and trails —
+    // collision avoidance cannot help with those.
+    lv_draw_rect_dsc_t back;
+    lv_draw_rect_dsc_init(&back);
+    back.bg_color = theme::c(theme::kRadarBg);
+    back.bg_opa = p.selected ? 210 : 165;
+    back.radius = 3;
+    lv_area_t backArea = {lp.rect.x1 + ox_, lp.rect.y1 + oy_, lp.rect.x2 + ox_,
+                          lp.rect.y2 + oy_};
+    lv_draw_rect(layer, &back, &backArea);
+
+    drawText(layer, lp.rect.x1 + 3 + ox_, lp.rect.y1 + 1 + oy_,
+             lp.rect.x2 - lp.rect.x1 - 6, lp.text,
+             theme::c(p.selected ? theme::kSelection : theme::kRadarLabel),
+             LV_OPA_COVER, theme::fontRadar(), LV_TEXT_ALIGN_LEFT);
+  }
+}
+
+void RadarView::drawLegend(lv_layer_t *layer) {
+  const int32_t height = kLegend.barBot - kLegend.barTop;
+
+  // Backdrop for legibility. Its extent is also what seedStaticBlockers()
+  // reserves, so both read kLegend rather than repeating the arithmetic.
   lv_draw_rect_dsc_t back;
   lv_draw_rect_dsc_init(&back);
-  back.bg_color = lv_color_hex(kBgColor);
+  back.bg_color = theme::c(theme::kRadarBg);
   back.bg_opa = 190;
-  back.radius = 4;
-  lv_area_t backArea = {kSize - 48, yTop - 20, kSize - 2, yBot + 6};
+  back.radius = theme::kRadSm;
+  lv_area_t backArea = {kLegend.x1 + ox_, kLegend.y1 + oy_, kLegend.x2 + ox_,
+                        kLegend.y2 + oy_};
   lv_draw_rect(layer, &back, &backArea);
 
-  drawText(layer, kSize - 48, yTop - 19, 46, "kft", lv_color_hex(0x7A8A9A),
-           LV_OPA_COVER, &lv_font_montserrat_14, LV_TEXT_ALIGN_CENTER);
+  drawText(layer, kLegend.x1 + ox_, kLegend.y1 + 1 + oy_, 46, "kft",
+           theme::c(theme::kTextMuted), LV_OPA_COVER, theme::fontRadar(),
+           LV_TEXT_ALIGN_CENTER);
 
   // Gradient bar (top = highest altitude).
   const int segs = 40;
@@ -655,49 +909,119 @@ void RadarView::drawLegend(lv_layer_t *layer) {
   for (int i = 0; i < segs; ++i) {
     const float t = 1.0f - (static_cast<float>(i) + 0.5f) / static_cast<float>(segs);
     seg.bg_color = altitudeColor(static_cast<int>(t * kMaxAltitudeFt));
-    const int32_t y1 = yTop + i * height / segs;
-    const int32_t y2 = yTop + (i + 1) * height / segs;
-    lv_area_t segArea = {x0, y1, x0 + barW, y2};
+    const int32_t y1 = kLegend.barTop + i * height / segs;
+    const int32_t y2 = kLegend.barTop + (i + 1) * height / segs;
+    lv_area_t segArea = {kLegend.barX + ox_, y1 + oy_,
+                         kLegend.barX + kLegend.barW + ox_, y2 + oy_};
     lv_draw_rect(layer, &seg, &segArea);
   }
 
   // Tick labels: 0,10,20,30,40 kft.
   for (int k = 0; k <= 40; k += 10) {
     const float frac = static_cast<float>(k * 1000) / static_cast<float>(kMaxAltitudeFt);
-    const int32_t y = yBot - static_cast<int32_t>(lroundf(frac * height)) - 8;
+    const int32_t y = kLegend.barBot - static_cast<int32_t>(lroundf(frac * height)) - 8;
     char t[4];
     snprintf(t, sizeof(t), "%d", k);
-    drawText(layer, kSize - 46, y, 26, t, lv_color_hex(0x9AAAB8), LV_OPA_COVER,
-             &lv_font_montserrat_14, LV_TEXT_ALIGN_RIGHT);
+    drawText(layer, kLegend.barX - 30 + ox_, y + oy_, 26, t,
+             theme::c(theme::kLegendTick), LV_OPA_COVER, theme::fontRadar(),
+             LV_TEXT_ALIGN_RIGHT);
   }
 }
 
 void RadarView::redraw() {
-  if (canvas_ == nullptr) {
+  if (obj_ == nullptr) {
     return;
   }
+  if (!bgValid_) {
+    renderBackgroundCache();
+  }
 
-  lv_canvas_fill_bg(canvas_, lv_color_hex(kBgColor), LV_OPA_COVER);
-
-  lv_layer_t layer;
-  lv_canvas_init_layer(canvas_, &layer);
-
-  drawBackground(&layer);
-
-  // Draw in layers rather than per-aircraft, so no aircraft's trail or symbol
-  // can land on top of another's label.
+  // Solve the frame here; the actual painting happens in onDraw(), which LVGL
+  // calls back during lv_timer_handler() once per invalidated region.
   buildDrawOrder();
+
+  // Nothing moved by a whole pixel? Then there is nothing to paint. At 25 nm
+  // range a 450 kt aircraft crosses about one pixel per second, so without this
+  // the view repaints ten-plus times per pixel of real movement. That cost two
+  // visible artefacts: the label solver re-ran every frame and could pick a
+  // different anchor each time (labels flickering), and the repaints starved
+  // lv_timer_handler, so the info panel's marquee animation stepped
+  // irregularly. Both are fixed by simply not painting an identical frame.
+  const uint32_t sig = paintSignature();
+  if (!fullRepaint_ && !trailsChanged_ && hasPainted_ && sig == lastPaintSig_) {
+    return;
+  }
+  lastPaintSig_ = sig;
+  hasPainted_ = true;
+
+  // Only the frames that actually paint pay for the anchor solver.
+  probe::Scope solveScope(probe::kTasks);
+  layoutLabels();
+  collectDirty();
+
+  if (fullRepaint_) {
+    fullRepaint_ = false;
+    lv_obj_invalidate(obj_);
+  } else {
+    invalidateDirty();
+  }
+  trailsChanged_ = false;
+  memcpy(prevDirty_, dirty_, dirtyCount_ * sizeof(Rect));
+  prevDirtyCount_ = dirtyCount_;
+  probe::countFrame();
+}
+
+void RadarView::onCoverCheck(lv_event_t *e) {
+  auto *self = static_cast<RadarView *>(lv_event_get_user_data(e));
+  // The background image is opaque and covers the whole object, so LVGL can
+  // skip everything underneath -- including filling the screen background,
+  // which would be a full-area write we would then paint straight over.
+  lv_event_set_cover_res(e, self != nullptr && self->bgValid_ ? LV_COVER_RES_COVER
+                                                             : LV_COVER_RES_NOT_COVER);
+}
+
+void RadarView::onDraw(lv_event_t *e) {
+  auto *self = static_cast<RadarView *>(lv_event_get_user_data(e));
+  if (self == nullptr) {
+    return;
+  }
+  probe::Scope _(probe::kRaster);
+  self->paintDirect(lv_event_get_layer(e));
+}
+
+void RadarView::paintDirect(lv_layer_t *layer) {
+  lv_area_t coords;
+  lv_obj_get_coords(obj_, &coords);
+  ox_ = coords.x1;
+  oy_ = coords.y1;
+
+  // The region LVGL is asking for, in local coordinates, so the draw loops can
+  // skip work that would be clipped away anyway.
+  clip_ = {static_cast<int16_t>(layer->_clip_area.x1 - ox_),
+           static_cast<int16_t>(layer->_clip_area.y1 - oy_),
+           static_cast<int16_t>(layer->_clip_area.x2 - ox_),
+           static_cast<int16_t>(layer->_clip_area.y2 - oy_)};
+
+  if (bgValid_) {
+    // Restores the static chrome and erases the previous frame in one pass.
+    // LVGL clips this to the invalid region, so it costs only what changed.
+    lv_draw_image_dsc_t img;
+    lv_draw_image_dsc_init(&img);
+    img.src = &bgImg_;
+    img.opa = LV_OPA_COVER;
+    lv_draw_image(layer, &img, &coords);
+  }
+
   for (size_t i = 0; i < orderCount_; ++i) {
-    drawTrail(&layer, order_[i]);
+    if (!culled(order_[i].box)) drawTrail(layer, order_[i]);
   }
   for (size_t i = 0; i < orderCount_; ++i) {
-    drawSymbol(&layer, order_[i]);
+    if (!culled(order_[i].box)) drawSymbol(layer, order_[i]);
   }
-  drawLabels(&layer);
-
-  drawLegend(&layer);
-
-  lv_canvas_finish_layer(canvas_, &layer);
+  paintLabels(layer);
+  // Stays live rather than baked into the cache: it is drawn last so aircraft
+  // never obscure it, which is only true if it paints after the symbols.
+  drawLegend(layer);
 }
 
 void RadarView::onClicked(lv_event_t *e) {
@@ -706,7 +1030,7 @@ void RadarView::onClicked(lv_event_t *e) {
   }
 
   auto *self = static_cast<RadarView *>(lv_event_get_user_data(e));
-  if (self == nullptr || self->canvas_ == nullptr) {
+  if (self == nullptr || self->obj_ == nullptr) {
     return;
   }
 
@@ -719,7 +1043,7 @@ void RadarView::onClicked(lv_event_t *e) {
   lv_indev_get_point(indev, &point);
 
   lv_area_t coords;
-  lv_obj_get_coords(self->canvas_, &coords);
+  lv_obj_get_coords(self->obj_, &coords);
   const int32_t localX = point.x - coords.x1;
   const int32_t localY = point.y - coords.y1;
 

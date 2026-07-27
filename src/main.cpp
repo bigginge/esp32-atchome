@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include "log.hpp"
 #include <WiFi.h>
 #include <Wire.h>
 #include <lvgl.h>
@@ -20,9 +21,11 @@
 #include "radar_view.hpp"
 #include "info_panel.hpp"
 #include "settings_screen.hpp"
+#include "theme.hpp"
+#include "frame_probe.hpp"
 
-static constexpr uint16_t kHorRes = 800;
-static constexpr uint16_t kVerRes = 480;
+static constexpr uint16_t kHorRes = theme::layout::kScreenW;
+static constexpr uint16_t kVerRes = theme::layout::kScreenH;
 
 static constexpr int kTouchSda = 19;
 static constexpr int kTouchScl = 20;
@@ -66,8 +69,16 @@ static void dispFlush(lv_display_t *disp, const lv_area_t * /*area*/, uint8_t *p
   // DIRECT render mode: pxMap is one of the two framebuffers. Present it once
   // per refresh and wait for the flip so LVGL never draws into the scanned FB.
   if (lv_display_flush_is_last(disp)) {
-    esp_lcd_panel_draw_bitmap(lcd.panel(), 0, 0, kHorRes, kVerRes, pxMap);
-    lcd.waitVsync();
+    {
+      probe::Scope _(probe::kPresent);
+      esp_lcd_panel_draw_bitmap(lcd.panel(), 0, 0, kHorRes, kVerRes, pxMap);
+    }
+    // Timed separately: this is idle time waiting for the panel, not work. At
+    // ~24 Hz it averages ~21 ms and would swamp every other number.
+    {
+      probe::Scope _(probe::kVsync);
+      lcd.waitVsync();
+    }
   }
   lv_display_flush_ready(disp);
 }
@@ -152,7 +163,7 @@ static int runScan() {
   }
 
   netctl::setScanCount(k);
-  Serial.printf("[setup] scan: %u networks\n", static_cast<unsigned>(k));
+  Log.printf("[setup] scan: %u networks\n", static_cast<unsigned>(k));
   return static_cast<int>(k);
 }
 
@@ -160,7 +171,7 @@ static int runConnect() {
   const char *ssid = nullptr;
   const char *pass = nullptr;
   netctl::connectArgs(&ssid, &pass);
-  Serial.printf("[setup] connecting to \"%s\"\n", ssid);
+  Log.printf("[setup] connecting to \"%s\"\n", ssid);
 
   WiFi.disconnect(false);
   WiFi.begin(ssid, pass[0] != '\0' ? pass : nullptr);
@@ -172,9 +183,9 @@ static int runConnect() {
 
   const int status = static_cast<int>(WiFi.status());
   if (status == WL_CONNECTED) {
-    Serial.printf("[setup] connected %s\n", WiFi.localIP().toString().c_str());
+    Log.printf("[setup] connected %s\n", WiFi.localIP().toString().c_str());
   } else {
-    Serial.printf("[setup] connect failed, status %d\n", status);
+    Log.printf("[setup] connect failed, status %d\n", status);
   }
   return status;
 }
@@ -257,7 +268,7 @@ static void networkTask(void * /*arg*/) {
         continue;
       }
       if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("[WiFi] Reconnected %s\n", WiFi.localIP().toString().c_str());
+        Log.printf("[WiFi] Reconnected %s\n", WiFi.localIP().toString().c_str());
         configTzTime("GMT0BST,M3.5.0,M10.5.0", "pool.ntp.org");
         gNetStatus = 0;
       } else {
@@ -270,7 +281,7 @@ static void networkTask(void * /*arg*/) {
     if (lastFetch == 0 || now - lastFetch >= settings::kRefreshIntervalMs) {
       lastFetch = now;
       gFreeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-      Serial.printf("[mem] free internal %u B before fetch\n",
+      Log.printf("[mem] free internal %u B before fetch\n",
                     static_cast<unsigned>(gFreeInternal));
       size_t count = 0;
       const bool ok = fetchNearbyAircraft(static_cast<float>(homeLat),
@@ -356,10 +367,10 @@ static bool connectWiFi(const char *ssid, const char *pass, uint32_t timeoutMs) 
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("[WiFi] Connected %s\n", WiFi.localIP().toString().c_str());
+    Log.printf("[WiFi] Connected %s\n", WiFi.localIP().toString().c_str());
     return true;
   }
-  Serial.println("[WiFi] Connection failed");
+  Log.println("[WiFi] Connection failed");
   infoPanel.showStatus("WiFi failed");
   return false;
 }
@@ -388,9 +399,66 @@ static void applySettingsChange() {
   gLastFetchOkMs = 0;
 }
 
+#if ATC_BENCH
+/**
+ * What PSRAM bandwidth is actually available with the LCD scanning out?
+ *
+ * The panel reads 800*480*2 B at ~24 Hz = ~18 MB/s continuously through the
+ * bounce buffers, so the figures here are the *contended* numbers -- which are
+ * the only ones that matter for judging the render path.
+ */
+static void benchPsram() {
+  constexpr size_t kBytes = 448u * 448u * 2u;
+  uint8_t *a = static_cast<uint8_t *>(heap_caps_malloc(kBytes, MALLOC_CAP_SPIRAM));
+  uint8_t *b = static_cast<uint8_t *>(heap_caps_malloc(kBytes, MALLOC_CAP_SPIRAM));
+  if (a == nullptr || b == nullptr) {
+    Log.println("[bench] alloc failed");
+    heap_caps_free(a);
+    heap_caps_free(b);
+    return;
+  }
+  const float mb = static_cast<float>(kBytes) / (1024.0f * 1024.0f);
+
+  uint32_t t = micros();
+  memset(a, 0, kBytes);
+  const uint32_t tMemset = micros() - t;
+
+  t = micros();
+  memcpy(b, a, kBytes);
+  const uint32_t tMemcpy = micros() - t;
+
+  // The shape lv_canvas_fill_bg uses: a scalar 16-bit store loop.
+  t = micros();
+  uint16_t *p = reinterpret_cast<uint16_t *>(a);
+  for (size_t i = 0; i < kBytes / 2; ++i) p[i] = 0x1234;
+  const uint32_t tStore16 = micros() - t;
+
+  // Row-wise copy, the shape a dirty-rect restore would use (128 px rows).
+  t = micros();
+  for (size_t y = 0; y < 448; ++y) {
+    memcpy(b + y * 896, a + y * 896, 256);
+  }
+  const uint32_t tRows = micros() - t;
+
+  Log.printf("[bench] %u KB: memset=%lu us (%.1f MB/s) memcpy=%lu us (%.1f MB/s) "
+             "store16=%lu us (%.1f MB/s) rows448x256B=%lu us\n",
+             static_cast<unsigned>(kBytes / 1024),
+             static_cast<unsigned long>(tMemset), mb * 1e6f / tMemset,
+             static_cast<unsigned long>(tMemcpy), mb * 1e6f / tMemcpy,
+             static_cast<unsigned long>(tStore16), mb * 1e6f / tStore16,
+             static_cast<unsigned long>(tRows));
+
+  heap_caps_free(a);
+  heap_caps_free(b);
+}
+#endif
+
 static bool initLvgl() {
   lv_init();
   lv_tick_set_cb(lvTickCb);
+  // Styles are plain globals, but their property storage is lv_malloc'd, so
+  // this has to run after lv_init() and before the first object is created.
+  theme::init();
 
   lv_display_t *disp = lv_display_create(kHorRes, kVerRes);
   lv_display_set_flush_cb(disp, dispFlush);
@@ -404,7 +472,7 @@ static bool initLvgl() {
   lv_indev_set_read_cb(indev, touchRead);
 
   lv_obj_t *screen = lv_screen_active();
-  lv_obj_set_style_bg_color(screen, lv_color_hex(0x0B1218), 0);
+  lv_obj_set_style_bg_color(screen, theme::c(theme::kBgApp), 0);
   lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -417,10 +485,10 @@ static bool initLvgl() {
 }
 
 void setup() {
-  Serial.begin(115200);
+  Log.begin(115200);
   delay(200);
-  Serial.println();
-  Serial.println("===== ESP32 ATC Home =====");
+  Log.println();
+  Log.println("===== ESP32 ATC Home =====");
 
   gMutex = xSemaphoreCreateMutex();
 
@@ -428,23 +496,23 @@ void setup() {
   settings::load();
   {
     const AppSettings &cfg = settings::get();
-    Serial.printf("Home: %.6f, %.6f  radius %d nm\n", cfg.latitude, cfg.longitude,
+    Log.printf("Home: %.6f, %.6f  radius %d nm\n", cfg.latitude, cfg.longitude,
                   cfg.radiusNm);
   }
 
-  Serial.println("Reset touch controller...");
+  Log.println("Reset touch controller...");
   resetTouchViaPca9557();
 
-  Serial.println("Init display...");
+  Log.println("Init display...");
   if (!lcd.init()) {
-    Serial.println("Display init failed");
+    Log.println("Display init failed");
     return;
   }
   lcd.setBrightness(255);
 
-  Serial.println("Init LVGL...");
+  Log.println("Init LVGL...");
   if (!initLvgl()) {
-    Serial.println("LVGL init failed");
+    Log.println("LVGL init failed");
     return;
   }
 
@@ -488,18 +556,25 @@ void setup() {
   netctl::exitSetupMode();
   configTzTime("GMT0BST,M3.5.0,M10.5.0", "pool.ntp.org");
 
-  Serial.printf("[mem] free internal after init: %u B\n",
+  Log.printf("[mem] free internal after init: %u B\n",
                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
-  Serial.println("Ready.");
+#if ATC_BENCH
+  benchPsram();
+#endif
+  Log.println("Ready.");
 }
 
 void loop() {
-  lv_timer_handler();
+  {
+    probe::Scope _(probe::kLvgl);
+    lv_timer_handler();
+  }
+  probe::report(millis());
 
   // ===== Settings wizard =====
   // While it is open, skip the rest of loop(): RadarView::redraw() rasterises
-  // the full 480x480 PSRAM canvas every 50 ms whether or not anything will
-  // blit it, and the wizard's overlay hides it anyway.
+  // the full PSRAM canvas every 50 ms whether or not anything will blit it,
+  // and the wizard's overlay hides it anyway.
   static bool inSetupMode = false;
   if (settingsScreen.isOpen()) {
     delay(5);
@@ -570,6 +645,16 @@ void loop() {
       }
     }
     if (moving || gDataDirty || !everPainted) {
+      // New data grows the trails, which the per-frame dirty rects do not cover
+      // -- those track only the symbols and labels, all that moves between
+      // fetches. A full repaint here would be a ~200 ms hitch every 5 seconds,
+      // so only the trail extents are invalidated.
+      if (gDataDirty) {
+        radarView.markDataChanged();
+      }
+      if (!everPainted) {
+        radarView.markFullRepaint();
+      }
       radarView.setSnapshot(arr, n, uiHasSel ? sel->hex : "");
       radarView.redraw();
       everPainted = true;
