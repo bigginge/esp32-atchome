@@ -51,6 +51,104 @@ void drawText(lv_layer_t *layer, int32_t x, int32_t y, int32_t w,
   lv_draw_label(layer, &dsc, &area);
 }
 
+/** Narrows a layer's clip area and always puts it back.
+ *
+ *  lv_layer_t::_clip_area is documented (lv_draw.h:118-126) as settable before
+ *  adding draw tasks; lv_draw_add_task() copies it into each task. That is the
+ *  sanctioned way to clip one draw call, and it is mandatory for the sweep:
+ *  lv_draw_arc() sets its task area to the *full circle* bounding box
+ *  (lv_draw_arc.c:60-63), not the angular extent, so an unclipped wedge would
+ *  mask ~186 000 px -- about as much as the whole rest of the frame.
+ *
+ *  RAII rather than a manual restore because everything after the sweep in
+ *  paintDirect() would silently inherit a leaked clip. */
+struct ClipScope {
+  lv_layer_t *layer;
+  lv_area_t saved;
+  explicit ClipScope(lv_layer_t *l) : layer(l), saved(l->_clip_area) {}
+  ~ClipScope() { layer->_clip_area = saved; }
+  ClipScope(const ClipScope &) = delete;
+  ClipScope &operator=(const ClipScope &) = delete;
+};
+
+int32_t wrap360(int32_t deg) {
+  deg %= 360;
+  return deg < 0 ? deg + 360 : deg;
+}
+
+// Hand-rolled rather than lv_area_intersect(), which lives behind
+// lv_area_private.h in LVGL 9.5 and is not part of the public surface.
+bool areaIntersect(lv_area_t *out, const lv_area_t &a, const lv_area_t &b) {
+  out->x1 = a.x1 > b.x1 ? a.x1 : b.x1;
+  out->y1 = a.y1 > b.y1 ? a.y1 : b.y1;
+  out->x2 = a.x2 < b.x2 ? a.x2 : b.x2;
+  out->y2 = a.y2 < b.y2 ? a.y2 : b.y2;
+  return out->x1 <= out->x2 && out->y1 <= out->y2;
+}
+
+// One-shot check of lv_draw_arc_get_area(). Set to 1, flash, read the [arc]
+// lines on serial, set back to 0. It exists because get_area() is exercised by
+// the lv_arc widget for the annulus case but not obviously for the degenerate
+// pie case (width == radius, so the inner radius collapses to 0), and the whole
+// sweep budget rests on that box being tight.
+#define ATC_VERIFY_ARC_AREA 0
+
+// Per-segment trace of drawSweep's clip intersection. Set to 1 to find out why
+// the sweep is not appearing; it prints several lines per tick, so never leave
+// it on.
+#ifndef ATC_SWEEP_TRACE
+#define ATC_SWEEP_TRACE 0
+#endif
+
+#if ATC_VERIFY_ARC_AREA
+/** Bounding box from first principles: the four ray endpoints (both radii at
+ *  both ends of the span) plus, for each quadrant boundary inside the span, the
+ *  outer-radius extreme it produces. */
+lv_area_t analyticArcArea(int32_t cx, int32_t cy, int32_t rout, int32_t rin,
+                          int32_t s, int32_t e) {
+  lv_area_t a = {INT32_MAX, INT32_MAX, INT32_MIN, INT32_MIN};
+  auto add = [&a](int32_t x, int32_t y) {
+    if (x < a.x1) a.x1 = x;
+    if (y < a.y1) a.y1 = y;
+    if (x > a.x2) a.x2 = x;
+    if (y > a.y2) a.y2 = y;
+  };
+  for (int end = 0; end < 2; ++end) {
+    const float rad = static_cast<float>(end == 0 ? s : e) * 3.14159265f / 180.0f;
+    for (int r = 0; r < 2; ++r) {
+      const float rr = static_cast<float>(r == 0 ? rin : rout);
+      add(cx + static_cast<int32_t>(lroundf(cosf(rad) * rr)),
+          cy + static_cast<int32_t>(lroundf(sinf(rad) * rr)));
+    }
+  }
+  for (int32_t q = 0; q <= 720; q += 90) {
+    if (q < s || q > e) continue;
+    const float rad = static_cast<float>(q) * 3.14159265f / 180.0f;
+    add(cx + static_cast<int32_t>(lroundf(cosf(rad) * rout)),
+        cy + static_cast<int32_t>(lroundf(sinf(rad) * rout)));
+  }
+  return a;
+}
+
+void verifyArcArea(int32_t cx, int32_t cy, int32_t rout) {
+  const int32_t widths[2] = {rout, rout / 3};
+  for (int w = 0; w < 2; ++w) {
+    for (int32_t s = 0; s < 360; s += 37) {
+      const int32_t e = s + 62;
+      lv_area_t lv;
+      lv_draw_arc_get_area(cx, cy, static_cast<uint16_t>(rout), s, e, widths[w],
+                           false, &lv);
+      const lv_area_t an = analyticArcArea(cx, cy, rout, rout - widths[w],
+                                           wrap360(s), wrap360(s) + 62);
+      Log.printf("[arc] w=%ld s=%ld e=%ld lv=(%ld,%ld,%ld,%ld) an=(%ld,%ld,%ld,%ld)\n",
+                 (long)widths[w], (long)s, (long)e, (long)lv.x1, (long)lv.y1,
+                 (long)lv.x2, (long)lv.y2, (long)an.x1, (long)an.y1, (long)an.x2,
+                 (long)an.y2);
+    }
+  }
+}
+#endif  // ATC_VERIFY_ARC_AREA
+
 }  // namespace
 
 lv_color_t altitudeColor(int altitudeFt) {
@@ -100,6 +198,9 @@ bool RadarView::create(lv_obj_t *parent, float rangeNm) {
   lv_obj_add_event_cb(obj_, onCoverCheck, LV_EVENT_COVER_CHECK, this);
 
   renderBackgroundCache();
+#if ATC_VERIFY_ARC_AREA
+  verifyArcArea(kSize / 2, kSize / 2, ringRadius(kRings));
+#endif
   redraw();
   return true;
 }
@@ -928,6 +1029,244 @@ void RadarView::drawLegend(lv_layer_t *layer) {
   }
 }
 
+// Measured costs, at 448 px. A second of wall clock has to cover all three,
+// and the data repaints get first call -- which is what tickSweep()'s governor
+// arbitrates.
+//   ~2.0 ms   an idle loop() iteration (the delay(2) at the end of loop())
+//   ~93 ms    one data repaint (up to 4 regions, each with its VSYNC wait)
+//   ~28 ms    one sweep tick (one region, ~8 ms raster + ~20 ms VSYNC wait)
+float RadarView::sweepStepDeg() const {
+  // Rungs 0-2 give 8, 4 and 2 ticks/s. kSweepOffRung never reaches here.
+  return kSweepStepDeg * static_cast<float>(1 << sweepRung_);
+}
+
+RadarView::Rect RadarView::sweepWedgeBox(float headDeg) const {
+  const int32_t rout = ringRadius(kRings);
+  const int32_t width = kSweepAnnulusOnly ? rout / 3 : rout;
+  // Matches drawSweep()'s extremes: the trailing segment starts one degree
+  // before the nominal tail (the segments overlap so their seams do not show).
+  const int32_t s = wrap360(static_cast<int32_t>(lroundf(headDeg - kSweepTailDeg)) - 1);
+  const int32_t e = s + static_cast<int32_t>(lroundf(kSweepTailDeg)) + 2;
+
+  lv_area_t a;
+  lv_draw_arc_get_area(kSize / 2, kSize / 2, static_cast<uint16_t>(rout), s, e,
+                       width, false, &a);
+
+  // Pad for antialiasing and for lv_draw_arc()'s off-by-one task area
+  // (x2 = cx + radius - 1 where get_area uses cx + radius), then clamp: the
+  // result is handed to lv_obj_invalidate_area and used for clip culling.
+  auto clamp = [](int32_t v) -> int16_t {
+    if (v < 0) v = 0;
+    if (v > kSize - 1) v = kSize - 1;
+    return static_cast<int16_t>(v);
+  };
+  return {clamp(a.x1 - 3), clamp(a.y1 - 3), clamp(a.x2 + 3), clamp(a.y2 + 3)};
+}
+
+void RadarView::tickSweep(unsigned long nowMs) {
+  if (!kSweepEnabled || obj_ == nullptr) {
+    return;
+  }
+  if (!sweepStarted_) {
+    sweepStarted_ = true;
+    sweepLastMs_ = nowMs;
+    sweepRateAtMs_ = nowMs;
+    sweepBox_ = sweepWedgeBox(sweepDrawnDeg_);
+    return;
+  }
+
+  // Closed loop on the one metric the sweep is allowed to spend. loop() calls
+  // this exactly once per iteration, so counting calls over a second measures
+  // the loop rate directly -- and it is the loop rate, not the frame rate, that
+  // makes LVGL's animation stepping smooth. Below ~60/s the stepping goes
+  // visibly irregular, which was a real reported bug, so the sweep (decoration)
+  // drops frames before the data (the product) does.
+  //
+  // Driven by measurement rather than by aircraft count because count turned
+  // out to be a poor proxy: at 5 aircraft the data repaints took ~380 ms of the
+  // second and the full-rate sweep fitted easily, while at 13 they took ~900 ms
+  // and the same sweep would have consumed most of what was left. The top rung
+  // switches the sweep off outright, which lands it where the plan's fallback
+  // ladder ends up anyway -- an "alive but nothing much flying" indicator --
+  // except reached by measurement instead of a hand-set condition.
+  //
+  // The thresholds are far apart on purpose -- one rung is worth up to
+  // ~110 ms/s, i.e. ~55 loops/s -- and the rate is smoothed before they are
+  // applied. Both are needed: a raw one-second sample swings between 30 and
+  // 330 Hz at a fixed rung, purely because the data repaints are bursty, and
+  // tested against raw samples the controller hunted across all four rungs
+  // every few seconds. Since the top rung is "off", that hunting was visible as
+  // the sweep repeatedly vanishing and returning, which is worse than any
+  // amount of steppiness. The EMA's ~4 s time constant is what makes it settle.
+  ++sweepCalls_;
+  const uint32_t window = static_cast<uint32_t>(nowMs) - static_cast<uint32_t>(sweepRateAtMs_);
+  if (window >= 1000) {
+    const uint32_t hz = sweepCalls_ * 1000 / window;
+    sweepHzAvg_ = sweepHzAvg_ == 0 ? hz : (sweepHzAvg_ * 3 + hz) / 4;
+    // Two constraints, and both were originally set too high.
+    //
+    // The descend threshold has to be reachable *while the sweep runs at the
+    // current rung*, or "off" is a one-way trap: at 300 Hz it never was, so a
+    // boot transient (WiFi connect suffices) latched the sweep off for good.
+    //
+    // The climb threshold used to be 90 because below ~60 loops/s LVGL stepped
+    // the info panel's marquee animations visibly unevenly. Those marquees are
+    // gone -- the values ellipsize now -- so nothing left is animation-timed
+    // except the settings-wizard spinner, and the radar does not redraw while
+    // the wizard is open. What remains is touch sampling, which lv_timer_handler
+    // does once per loop; 40/s is a 25 ms response, imperceptible. Buying that
+    // headroom is what keeps the sweep off its steppy low rungs.
+    const uint8_t was = sweepRung_;
+    if (sweepHzAvg_ < 40 && sweepRung_ < kSweepOffRung) {
+      ++sweepRung_;
+    } else if (sweepHzAvg_ > 90 && sweepRung_ > 0) {
+      --sweepRung_;
+    }
+    if (sweepRung_ != was) {
+      Log.printf("[sweep] loop=%lu/%luHz rung %u -> %u\n",
+                 static_cast<unsigned long>(hz),
+                 static_cast<unsigned long>(sweepHzAvg_), was, sweepRung_);
+    } else if (sweepRung_ != 0) {
+      // Silent while healthy, one line a second while degraded -- otherwise a
+      // latched-off sweep looks identical to a broken one.
+      Log.printf("[sweep] loop=%lu/%luHz rung %u%s\n",
+                 static_cast<unsigned long>(hz),
+                 static_cast<unsigned long>(sweepHzAvg_), sweepRung_,
+                 sweepRung_ >= kSweepOffRung ? " (off)" : "");
+    }
+    sweepCalls_ = 0;
+    sweepRateAtMs_ = nowMs;
+  }
+
+  // Delta accumulation, never `now % period`: millis() wraps at 2^32, which is
+  // not a multiple of the period, so the modulo form would jump once every
+  // 49.7 days. The subtraction below wraps correctly by construction.
+  const uint32_t dt = static_cast<uint32_t>(nowMs) - static_cast<uint32_t>(sweepLastMs_);
+  sweepLastMs_ = nowMs;
+  // The settings wizard makes loop() early-return for its whole lifetime, so
+  // the previous timestamp can be minutes stale. Drop the gap rather than
+  // teleporting the sweep across the screen the moment the wizard closes.
+  if (dt > 1000) {
+    return;
+  }
+  // Keep accumulating even while switched off, so the phase stays tied to the
+  // wall clock and the sweep resumes where it would have been.
+  sweepDeg_ += static_cast<float>(dt) * (360.0f / kSweepPeriodMs);
+  while (sweepDeg_ >= 360.0f) sweepDeg_ -= 360.0f;
+
+  const bool wantVisible = sweepRung_ < kSweepOffRung;
+  if (wantVisible != sweepVisible_) {
+    // One invalidation at the transition: switching off has to restore the
+    // background over the last wedge, and switching on has to paint the first.
+    sweepVisible_ = wantVisible;
+    sweepDrawnDeg_ = sweepDeg_;
+    const Rect prevBox = sweepBox_;
+    sweepBox_ = sweepWedgeBox(sweepDrawnDeg_);
+    invalidateSweepBand(prevBox, sweepBox_);
+    return;
+  }
+  if (!sweepVisible_) {
+    return;
+  }
+
+  float delta = sweepDeg_ - sweepDrawnDeg_;
+  if (delta < 0.0f) delta += 360.0f;
+  if (delta < sweepStepDeg()) {
+    return;  // not far enough to be worth a draw pass
+  }
+
+  const Rect prev = sweepBox_;
+  sweepDrawnDeg_ = sweepDeg_;
+  sweepBox_ = sweepWedgeBox(sweepDrawnDeg_);
+  invalidateSweepBand(prev, sweepBox_);
+}
+
+// One region, not two: each invalid area is a separate draw pass with ~5 ms of
+// fixed overhead, so the union of old and new is cheaper than the pair even
+// though it covers some untouched pixels in between. The old extent has to be
+// in there -- restoring the background cache over it is what erases the
+// previous wedge.
+void RadarView::invalidateSweepBand(const Rect &prev, const Rect &now) {
+  const Rect u = {prev.x1 < now.x1 ? prev.x1 : now.x1,
+                  prev.y1 < now.y1 ? prev.y1 : now.y1,
+                  prev.x2 > now.x2 ? prev.x2 : now.x2,
+                  prev.y2 > now.y2 ? prev.y2 : now.y2};
+
+  lv_area_t coords;
+  lv_obj_get_coords(obj_, &coords);
+  lv_area_t a = {u.x1 + coords.x1, u.y1 + coords.y1, u.x2 + coords.x1,
+                 u.y2 + coords.y1};
+  lv_obj_invalidate_area(obj_, &a);
+}
+
+void RadarView::drawSweep(lv_layer_t *layer) {
+  const int32_t rout = ringRadius(kRings);
+  if (rout < 12) {
+    return;
+  }
+  const int32_t width = kSweepAnnulusOnly ? rout / 3 : rout;
+
+  lv_draw_arc_dsc_t dsc;
+  lv_draw_arc_dsc_init(&dsc);
+  dsc.color = theme::c(theme::kSweep);
+  dsc.center.x = kSize / 2 + ox_;
+  dsc.center.y = kSize / 2 + oy_;
+  dsc.radius = static_cast<uint16_t>(rout);
+  dsc.width = width;
+  // NEVER set dsc.rounded: it lv_malloc's a width*width mask per wedge per
+  // frame (lv_draw_sw_arc.c:154) -- 5 KB each here, 46 KB each for a full pie.
+  dsc.rounded = 0;
+
+  ClipScope clip(layer);
+  const float seg = kSweepTailDeg / static_cast<float>(kSweepSegments);
+
+  for (int i = 0; i < kSweepSegments; ++i) {
+    // i == 0 is the leading edge, brightest; opacity falls off behind it.
+    const float endF = sweepDrawnDeg_ - seg * static_cast<float>(i);
+    const float startF = endF - seg - 1.0f;  // 1 deg overlap hides the seams
+    const int32_t s = wrap360(static_cast<int32_t>(lroundf(startF)));
+    int32_t e = wrap360(static_cast<int32_t>(lroundf(endF)));
+    if (e <= s) e += 360;
+
+    dsc.opa = static_cast<lv_opa_t>(static_cast<int>(kSweepOpa) *
+                                    (kSweepSegments - i) / kSweepSegments);
+    // These have to reach the descriptor, not just lv_draw_arc_get_area()
+    // below: lv_draw_arc_dsc_init() leaves both angles at 0 and lv_draw_arc()
+    // returns immediately when start == end (lv_draw_arc.c:57). Omitting them
+    // draws nothing at all while still costing the area arithmetic -- which
+    // reads as a sweep that is running (the probe shows time, the trace shows
+    // plausible angles) but is simply not on screen.
+    dsc.start_angle = static_cast<lv_value_precise_t>(s);
+    dsc.end_angle = static_cast<lv_value_precise_t>(e);
+
+    // The tight angular extent, which is the whole point: without it every
+    // segment would cost the full circle's bounding box.
+    lv_area_t a;
+    lv_draw_arc_get_area(dsc.center.x, dsc.center.y, dsc.radius, s, e, width,
+                         false, &a);
+    a.x1 -= 3;
+    a.y1 -= 3;
+    a.x2 += 3;
+    a.y2 += 3;
+    lv_area_t narrowed;
+    if (!areaIntersect(&narrowed, clip.saved, a)) {
+#if ATC_SWEEP_TRACE
+      Log.printf("[sweepdbg] seg%d SKIP arc=%ld,%ld..%ld,%ld clip=%ld,%ld..%ld,%ld\n", i,
+                 (long)a.x1, (long)a.y1, (long)a.x2, (long)a.y2, (long)clip.saved.x1,
+                 (long)clip.saved.y1, (long)clip.saved.x2, (long)clip.saved.y2);
+#endif
+      continue;  // ClipScope still restores on the way out
+    }
+#if ATC_SWEEP_TRACE
+    Log.printf("[sweepdbg] seg%d DRAW %ld,%ld..%ld,%ld opa=%u ang=%ld..%ld\n", i,
+               (long)narrowed.x1, (long)narrowed.y1, (long)narrowed.x2, (long)narrowed.y2,
+               (unsigned)dsc.opa, (long)s, (long)e);
+#endif
+    layer->_clip_area = narrowed;
+    lv_draw_arc(layer, &dsc);
+  }
+}
+
 void RadarView::redraw() {
   if (obj_ == nullptr) {
     return;
@@ -1010,6 +1349,13 @@ void RadarView::paintDirect(lv_layer_t *layer) {
     img.src = &bgImg_;
     img.opa = LV_OPA_COVER;
     lv_draw_image(layer, &img, &coords);
+  }
+
+  // First, so trails, symbols and labels all paint over it: the sweep should
+  // read as illumination, not make the primary data flicker.
+  if (kSweepEnabled && sweepVisible_ && !culled(sweepBox_)) {
+    probe::Scope _(probe::kSweep);
+    drawSweep(layer);
   }
 
   for (size_t i = 0; i < orderCount_; ++i) {

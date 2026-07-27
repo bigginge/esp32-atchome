@@ -35,6 +35,21 @@ class RadarView {
    *  here cost ~200 ms and landed every 5 seconds, on every fetch. */
   void markDataChanged() { trailsChanged_ = true; }
 
+  /** Advance the PPI sweep on wall-clock time and, if it has moved far enough
+   *  to be worth repainting, invalidate the band it swept through.
+   *
+   *  Call this every loop() iteration. It is deliberately independent of
+   *  redraw(), which skips painting entirely when nothing moved a whole pixel;
+   *  that skip is what leaves any headroom at all, and the sweep must not
+   *  defeat it. Running, the sweep costs roughly half of it: loop() sits at
+   *  45-150/s with the sweep on versus 150-250/s with it off. The sweep
+   *  contributes exactly one extra
+   *  invalid region per tick (each region costs ~5 ms of fixed draw-pass
+   *  overhead), covering the union of where the wedge was and where it now is.
+   *  The background cache is what erases the old wedge, which is why the old
+   *  extent has to be part of that union. */
+  void tickSweep(unsigned long nowMs);
+
  private:
   /** The canvas is a few hundred px square, so int16 is ample. Half the size of
    *  lv_area_t, which matters because RadarView is a global and these land in
@@ -105,6 +120,45 @@ class RadarView {
 
   void drawBackground(lv_layer_t *layer);
   void drawLegend(lv_layer_t *layer);
+
+  // ---- PPI sweep -----------------------------------------------------------
+  // One line to switch the whole feature off.
+  static constexpr bool kSweepEnabled = true;
+  // Outer annulus rather than a full pie. It covers roughly a third of the
+  // pixels *and* declutters the busy centre, where HOME and the densest labels
+  // live -- and because the inner radius clips the near-centre corner off the
+  // wedge's bounding box, it also shrinks the invalidated region, which is what
+  // actually costs money here. Several real PPI displays do exactly this.
+  static constexpr bool kSweepAnnulusOnly = true;
+  // 6 s per revolution rather than the 4 s originally planned. A tick costs a
+  // whole extra LVGL refresh cycle -- ~7-11 ms rasterising the wedge, ~8 ms
+  // restoring the background over the band, plus a ~20 ms VSYNC wait on a
+  // 24 Hz panel, so roughly 35-40 ms all in. The tick *rate* is therefore the
+  // lever, not the pixel count. Slowing the revolution keeps the angular step,
+  // and so the apparent smoothness, identical while cutting the rate to 8/s.
+  static constexpr float kSweepPeriodMs = 6000.0f;  // one revolution
+  static constexpr float kSweepTailDeg = 50.0f;
+  // Repaint every 7.5 deg: 8 ticks/s at 6 s/rev. Keeping tail + step under
+  // 90 deg also holds lv_draw_arc_get_area() on its tight two-quadrant path
+  // rather than its full-circle fallback.
+  static constexpr float kSweepStepDeg = 7.5f;
+  static constexpr int kSweepSegments = 4;
+  static constexpr uint8_t kSweepOpa = 110;  // leading segment; the tail fades
+  // Governor rungs: 0 = full rate, each rung halves it, and this one is "off".
+  static constexpr uint8_t kSweepOffRung = 3;
+
+  void drawSweep(lv_layer_t *layer);
+  /** Local-coordinate extent of the whole wedge with its head at `headDeg`
+   *  (LVGL angle convention: 0 = east, increasing clockwise on screen). */
+  Rect sweepWedgeBox(float headDeg) const;
+  /** How far the head must move before the sweep is worth a repaint -- i.e.
+   *  the sweep's frame rate, not its rotation rate, which is wall-clock driven
+   *  and never varies. Widens when loop() is under pressure, in the same spirit
+   *  as trailBudget() thinning the trails: the sweep is decoration and the
+   *  aircraft are the product, so the sweep gives ground first. */
+  float sweepStepDeg() const;
+  /** Invalidate the union of two wedge extents as a single region. */
+  void invalidateSweepBand(const Rect &prev, const Rect &now);
   /** Radius in px of range ring `i` (1..kRings). */
   int32_t ringRadius(int i) const;
   /** Box occupied by ring `i`'s nm caption. drawBackground() draws the text and
@@ -186,6 +240,21 @@ class RadarView {
   bool hasPainted_ = false;
   // The region currently being painted, in local coordinates.
   Rect clip_ = {0, 0, 0, 0};
+
+  // Sweep state. sweepDeg_ accumulates continuously; sweepDrawnDeg_ is the
+  // angle that was last invalidated and is therefore what paintDirect() draws,
+  // so what is on screen always matches what was asked to be repainted.
+  float sweepDeg_ = 270.0f;       // 270 in LVGL angles == due north
+  float sweepDrawnDeg_ = 270.0f;
+  unsigned long sweepLastMs_ = 0;
+  bool sweepStarted_ = false;
+  bool sweepVisible_ = false;  // false until the first tick, and at kSweepOffRung
+  Rect sweepBox_ = {0, 0, 0, 0};
+  // Frame-rate governor: 0 = full rate, each rung halves it, kSweepOffRung is off.
+  unsigned long sweepRateAtMs_ = 0;
+  uint16_t sweepCalls_ = 0;
+  uint32_t sweepHzAvg_ = 0;  // EMA of the loop rate; 0 until the first window
+  uint8_t sweepRung_ = 0;
 
   volatile bool pendingClick_ = false;
   float pendingEast_ = 0.0f;

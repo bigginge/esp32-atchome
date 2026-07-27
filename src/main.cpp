@@ -625,6 +625,13 @@ void loop() {
     uiCount = 0;
   }
 
+  // The sweep runs on wall-clock time and drives its own invalidation, so it
+  // is deliberately outside the frame throttle *and* outside redraw()'s
+  // "nothing moved" skip -- it has to keep turning over an empty sky, and it
+  // must not force the rest of the view to repaint when it does. It touches no
+  // tracker state, so it needs no lock.
+  radarView.tickSweep(now);
+
   // Animate + redraw the radar (under the lock; only when something changed).
   if (now - lastFrameMs >= kRadarFrameMs) {
     const float dt = lastFrameMs == 0 ? 0.0f : (now - lastFrameMs) / 1000.0f;
