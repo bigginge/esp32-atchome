@@ -206,6 +206,12 @@ void RadarView::renderBackgroundCache() {
 
   lv_obj_delete(scratch);
   bgValid_ = true;
+
+  // Re-encode after every re-render: the range change that invalidated the
+  // cache changed the ring radii and their captions, so the old runs describe
+  // the wrong picture. Failure here is not fatal -- bgCache_ is still valid and
+  // every read falls back to it.
+  buildBackgroundRle();
 }
 
 void RadarView::setSnapshot(const Aircraft *list, size_t count,
@@ -415,6 +421,155 @@ void RadarView::buildSweepRegions(float fromDeg, float toDeg) {
   }
 }
 
+namespace {
+
+/** Encode one row. Writes tokens to `out` and returns the count written; with
+ *  `out == nullptr` it only counts, which is how the exact allocation size is
+ *  known before allocating. The two modes share this one body deliberately --
+ *  a measure pass that can disagree with the write pass is a buffer overrun. */
+size_t encodeRleRow(const uint16_t *src, int32_t w, uint16_t *out) {
+  size_t n = 0;
+  int32_t x = 0;
+  while (x < w) {
+    int32_t run = 1;
+    while (x + run < w && src[x + run] == src[x]) ++run;
+
+    if (run >= 3) {
+      if (out != nullptr) {
+        out[n] = static_cast<uint16_t>(run);
+        out[n + 1] = src[x];
+      }
+      n += 2;
+      x += run;
+      continue;
+    }
+
+    // Gather everything up to the next run of 3+ into one literal block.
+    const int32_t start = x;
+    while (x < w) {
+      int32_t r = 1;
+      while (x + r < w && src[x + r] == src[x]) ++r;
+      if (r >= 3) break;
+      x += r;
+    }
+    int32_t len = x - start;
+    // 0x7FFF is the token's payload limit; rows are 448 px so this never trips
+    // in practice, but a silent truncation here would corrupt every row after.
+    while (len > 0) {
+      const int32_t chunk = len > 0x7FFF ? 0x7FFF : len;
+      if (out != nullptr) {
+        out[n] = static_cast<uint16_t>(0x8000 | chunk);
+        memcpy(&out[n + 1], &src[x - len], static_cast<size_t>(chunk) * 2);
+      }
+      n += 1 + static_cast<size_t>(chunk);
+      len -= chunk;
+    }
+  }
+  return n;
+}
+
+}  // namespace
+
+void RadarView::rleSpan(int32_t row, int32_t x1, int32_t x2, uint16_t *dst) const {
+  const uint16_t *p = bgRle_ + bgRleRow_[row];
+  int32_t x = 0;
+  while (x <= x2) {
+    const uint16_t tok = *p++;
+    const int32_t n = tok & 0x7FFF;
+    if (tok & 0x8000) {
+      if (x + n > x1) {
+        const int32_t s = LV_MAX(x1, x);
+        const int32_t e = LV_MIN(x2, x + n - 1);
+        memcpy(dst + (s - x1), p + (s - x), static_cast<size_t>(e - s + 1) * 2);
+      }
+      p += n;
+    } else {
+      const uint16_t v = *p++;
+      if (x + n > x1) {
+        const int32_t s = LV_MAX(x1, x);
+        const int32_t e = LV_MIN(x2, x + n - 1);
+        uint16_t *d = dst + (s - x1);
+        for (int32_t i = 0, c = e - s; i <= c; ++i) d[i] = v;
+      }
+    }
+    x += n;
+  }
+}
+
+bool RadarView::buildBackgroundRle() {
+  bgRleValid_ = false;
+  heap_caps_free(bgRle_);
+  heap_caps_free(bgRleRow_);
+  heap_caps_free(bgLine_);
+  bgRle_ = nullptr;
+  bgRleRow_ = nullptr;
+  bgLine_ = nullptr;
+
+  if (bgCache_ == nullptr) {
+    return false;
+  }
+  const size_t srcStride = bgImg_.header.stride;
+  auto rowPtr = [&](int32_t y) {
+    return reinterpret_cast<const uint16_t *>(bgCache_ +
+                                              static_cast<size_t>(y) * srcStride);
+  };
+
+  size_t total = 0;
+  for (int32_t y = 0; y < kSize; ++y) {
+    total += encodeRleRow(rowPtr(y), kSize, nullptr);
+  }
+
+  // The point of the exercise is to get this read out of PSRAM, so it is
+  // internal SRAM or nothing -- MALLOC_CAP_INTERNAL, never a plain malloc that
+  // could quietly satisfy itself from PSRAM and leave us slower than the
+  // memcpy we replaced.
+  const size_t tokenBytes = total * sizeof(uint16_t);
+  bgRle_ = static_cast<uint16_t *>(
+      heap_caps_malloc(tokenBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  bgRleRow_ = static_cast<uint32_t *>(
+      heap_caps_malloc(kSize * sizeof(uint32_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  bgLine_ = static_cast<uint16_t *>(
+      heap_caps_malloc(kSize * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  if (bgRle_ == nullptr || bgRleRow_ == nullptr || bgLine_ == nullptr) {
+    Log.printf("[radar] bg RLE needs %u B internal, unavailable -- using PSRAM cache\n",
+               static_cast<unsigned>(tokenBytes));
+    heap_caps_free(bgRle_);
+    heap_caps_free(bgRleRow_);
+    heap_caps_free(bgLine_);
+    bgRle_ = nullptr;
+    bgRleRow_ = nullptr;
+    bgLine_ = nullptr;
+    return false;
+  }
+
+  size_t at = 0;
+  for (int32_t y = 0; y < kSize; ++y) {
+    bgRleRow_[y] = static_cast<uint32_t>(at);
+    at += encodeRleRow(rowPtr(y), kSize, bgRle_ + at);
+  }
+  bgRleValid_ = true;
+
+  // Verify the decode reproduces the cache exactly, every row, before anything
+  // draws from it. This costs one pass at init and is the only pixel-identity
+  // check available on-device; tests/host covers the geometry but never sees
+  // this buffer. A mismatch falls back rather than shipping a corrupt frame.
+  for (int32_t y = 0; y < kSize; ++y) {
+    rleSpan(y, 0, kSize - 1, bgLine_);
+    if (memcmp(bgLine_, rowPtr(y), static_cast<size_t>(kSize) * 2) != 0) {
+      Log.printf("[radar] bg RLE self-check failed at row %d -- using PSRAM cache\n",
+                 static_cast<int>(y));
+      bgRleValid_ = false;
+      return false;
+    }
+  }
+
+  Log.printf("[radar] bg RLE %u B internal (was %u B PSRAM, %.1fx smaller)\n",
+             static_cast<unsigned>(tokenBytes),
+             static_cast<unsigned>(srcStride * kSize),
+             static_cast<double>(srcStride * kSize) / static_cast<double>(tokenBytes));
+  return true;
+}
+
 bool RadarView::compositeBackground(lv_layer_t *layer) {
   lv_draw_buf_t *buf = layer->draw_buf;
   if (bgCache_ == nullptr || !bgValid_ || buf == nullptr || buf->data == nullptr ||
@@ -452,13 +607,22 @@ bool RadarView::compositeBackground(lv_layer_t *layer) {
                bgCache_ + static_cast<size_t>(y - oy_) * srcStride) +
            (x - ox_);
   };
+  // Background pixels [x1..x2] of screen row y, straight into the layer. Out of
+  // the SRAM run list when there is one, otherwise the original PSRAM memcpy.
+  auto restore = [&](int32_t x1, int32_t x2, int32_t y) {
+    if (bgRleValid_) {
+      rleSpan(y - oy_, x1 - ox_, x2 - ox_, dstAt(x1, y));
+    } else {
+      memcpy(dstAt(x1, y), srcAt(x1, y), static_cast<size_t>(x2 - x1 + 1) * 2);
+    }
+  };
 
   // With the beam off this is only the background restore, which is what the
   // whole function was before the beam existed: a row-at-a-time copy out of the
   // cache, clipped to the region LVGL asked for.
   if (!sweepRunning_ || !kSweepEnabled) {
     for (int32_t y = ay1; y <= ay2; ++y) {
-      memcpy(dstAt(ax1, y), srcAt(ax1, y), static_cast<size_t>(ax2 - ax1 + 1) * 2);
+      restore(ax1, ax2, y);
     }
     return true;
   }
@@ -496,17 +660,17 @@ bool RadarView::compositeBackground(lv_layer_t *layer) {
     int32_t lo = 0, hi = 0;
     if (!sectorRowSpan(rayX[kSlices], rayY[kSlices], rayX[0], rayY[0], y - oy_, &lo,
                        &hi)) {
-      memcpy(dstAt(ax1, y), srcAt(ax1, y), static_cast<size_t>(ax2 - ax1 + 1) * 2);
+      restore(ax1, ax2, y);
       continue;
     }
     const int32_t wlo = LV_MAX(lo + ox_, ax1);
     const int32_t whi = LV_MIN(hi + ox_, ax2);
     if (wlo > whi) {  // the wedge is on this row but not in this region
-      memcpy(dstAt(ax1, y), srcAt(ax1, y), static_cast<size_t>(ax2 - ax1 + 1) * 2);
+      restore(ax1, ax2, y);
       continue;
     }
-    memcpy(dstAt(ax1, y), srcAt(ax1, y), static_cast<size_t>(wlo - ax1 + 1) * 2);
-    memcpy(dstAt(whi, y), srcAt(whi, y), static_cast<size_t>(ax2 - whi + 1) * 2);
+    restore(ax1, wlo, y);
+    restore(whi, ax2, y);
   }
 
   // Pass two: the beam itself, slice by slice.
@@ -541,7 +705,16 @@ bool RadarView::compositeBackground(lv_layer_t *layer) {
       if (x1 > x2) {
         continue;
       }
-      blendSpan(dstAt(x1, y), srcAt(x1, y), x2 - x1 + 1, fr, fg, fb, inv);
+      // The blend reads the background per pixel, so the RLE has to be decoded
+      // rather than filled straight out. Decoding into bgLine_ first still wins:
+      // the span is written once to SRAM and read back from SRAM, where the
+      // memcpy path read every one of these pixels from PSRAM.
+      if (bgRleValid_) {
+        rleSpan(y - oy_, x1 - ox_, x2 - ox_, bgLine_);
+        blendSpan(dstAt(x1, y), bgLine_, x2 - x1 + 1, fr, fg, fb, inv);
+      } else {
+        blendSpan(dstAt(x1, y), srcAt(x1, y), x2 - x1 + 1, fr, fg, fb, inv);
+      }
     }
   }
   return true;

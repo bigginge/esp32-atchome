@@ -120,6 +120,21 @@ class RadarView {
    *  lv_canvas -- the only public route to drawing into an arbitrary buffer.
    *  Runs at create and whenever the range changes, never per frame. */
   void renderBackgroundCache();
+
+  /** Re-encode bgCache_ as per-row RLE in *internal* SRAM. The restore is the
+   *  dominant per-pixel cost of every draw pass, and there are ~7 passes per
+   *  paint, so this is the hottest read in the view: sourcing it from SRAM
+   *  instead of PSRAM removes ~450 KB of PSRAM reads per pass and moves the
+   *  write off the memcpy path (9.4 MB/s) onto the fill path (15.2 MB/s).
+   *
+   *  Best-effort. Returns false and leaves bgRleValid_ clear if the encoding
+   *  does not fit the internal-SRAM budget or either allocation fails, in
+   *  which case every caller falls back to the bgCache_ memcpy unchanged. That
+   *  fallback is why this is safe to land without the host tests. */
+  bool buildBackgroundRle();
+  /** Decode background pixels [x1..x2] of local row `row` into `dst`.
+   *  Coordinates are local to the cache, i.e. already offset by ox_/oy_. */
+  void rleSpan(int32_t row, int32_t x1, int32_t x2, uint16_t *dst) const;
   /** Paint straight into the display's layer, i.e. the framebuffer. */
   void paintDirect(lv_layer_t *layer);
 
@@ -203,6 +218,23 @@ class RadarView {
   uint8_t *bgCache_ = nullptr;
   lv_image_dsc_t bgImg_ = {};
   bool bgValid_ = false;
+
+  // ---- Background RLE, in internal SRAM ------------------------------------
+  // Token stream, one run list per row, indexed by bgRleRow_[row]:
+  //   FILL  [count][value]                 count < 0x8000, covers `count` px
+  //   LIT   [0x8000|count][v0]..[vN-1]     `count` literal pixels
+  // A run of 3+ identical pixels is cheaper as a FILL; anything shorter is
+  // folded into a LIT block, which amortises its one-token header across the
+  // whole stretch of dissimilar pixels. Rows here are a handful of flat runs
+  // plus scattered literals (crosshairs, arcs, captions), which is the shape
+  // this encoding is for.
+  uint16_t *bgRle_ = nullptr;
+  uint32_t *bgRleRow_ = nullptr;
+  /** One decoded row. The beam blends *over* the background, so pass two needs
+   *  random-access source pixels, not just a fill -- it decodes into this and
+   *  blends from it, which keeps that read in SRAM too. */
+  uint16_t *bgLine_ = nullptr;
+  bool bgRleValid_ = false;
   // Screen-absolute origin of the view. Drawing now goes into the display's
   // layer rather than a canvas of our own, so every local coordinate needs it.
   // Zero while rendering the cache, which is in local coordinates.
