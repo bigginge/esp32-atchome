@@ -10,6 +10,32 @@ class RadarView {
   static constexpr int32_t kSize = theme::layout::kRadarSize;
   static constexpr int kRings = 4;
 
+  // ---- Sweep beam ----------------------------------------------------------
+  // A rotating PPI beam: a hot leading edge with a wedge of phosphor decay
+  // behind it, composited under the aircraft.
+  //
+  // COST MODEL, because these four numbers are the whole performance story and
+  // it is worth being able to reason about a change before flashing it. Every
+  // sweep step repaints the wedge swept since the last one *plus* the whole
+  // tail, because the tail's opacity is a function of angular distance from the
+  // head and therefore every pixel of it changes when the head moves. That is
+  //
+  //     px/step ~= pi * kSweepRadius^2 * (kSweepTailDeg + step) / 360
+  //
+  // at roughly 4.7 Mpx/s for the read-blend-write (PSRAM to PSRAM, contended
+  // with the LCD scan-out -- see benchPsram() in main.cpp), plus ~40% for the
+  // slack in the bounding rects handed to LVGL. At the defaults below that is
+  // ~25 kpx, ~7 ms, twelve and a half times a second: about a fifth of one core.
+  //
+  // So: a longer tail or a faster step both cost linearly. Widening the tail
+  // past 170 deg is not merely expensive, it is wrong -- the row-span solver in
+  // sectorRowSpan() assumes a convex sector.
+  static constexpr bool kSweepEnabled = true;
+  static constexpr uint32_t kSweepPeriodMs = 6000;  // one revolution
+  static constexpr uint32_t kSweepStepMs = 80;      // 12.5 steps/s
+  static constexpr float kSweepTailDeg = 55.0f;
+  static constexpr int32_t kSweepRadius = kSize / 2 - 8;  // == the outer ring
+
   bool create(lv_obj_t *parent, float rangeNm);
   void setRangeNm(float rangeNm);
 
@@ -50,6 +76,10 @@ class RadarView {
     int16_t symbolR;  // half-extent of the symbol's bounding box
     bool selected;
     Rect box;  // symbol + trail extent, for dirty tracking and clip culling
+    // How much the beam is currently flaring this blip, 0 when the beam is
+    // elsewhere. Quantised in buildDrawOrder() so that a symbol is only
+    // reinvalidated when the flare visibly steps, not on every sweep frame.
+    uint8_t lit;
   };
 
   /** Last frame's label placement, so a label that is still free keeps its
@@ -95,9 +125,12 @@ class RadarView {
 
   /** Rects this frame touches: symbol boxes, label boxes and leader lines. */
   void collectDirty();
-  /** Invalidate last frame's rects and this frame's, so the old pixels are
-   *  restored from the background cache and the new ones drawn. */
-  void invalidateDirty();
+  /** Invalidate the areas whose pixels differ from what is already in the
+   *  buffer. On a content frame that is last frame's rects and this frame's, so
+   *  the old pixels are restored from the background cache and the new ones
+   *  drawn. On a sweep-only frame it is just the swept wedge plus any blip
+   *  whose flare stepped -- nothing else moved. */
+  void invalidateDirty(bool contentChanged);
   /** True if `r` (local coords) lies outside the region being painted. LVGL
    *  calls the draw handler once per invalidated region, so without this every
    *  region would build draw tasks for every aircraft on screen. */
@@ -122,6 +155,31 @@ class RadarView {
    *  all. Cheap to compute -- it runs over order_, which buildDrawOrder() has
    *  just filled in. */
   uint32_t paintSignature() const;
+
+  // ---- Sweep beam ----------------------------------------------------------
+  /** Leading-edge bearing at `nowMs`, degrees clockwise from north. Derived
+   *  from the clock rather than accumulated, so a dropped frame slips the beam
+   *  rather than slowing it. */
+  static float sweepAngleAt(uint32_t nowMs);
+  /** Angular distance from `headDeg` backwards to `bearingDeg`, in [0, 360). */
+  static float degreesBehind(float bearingDeg, float headDeg);
+  /** Beam opacity `behindDeg` behind the leading edge; 0 past the tail. */
+  static lv_opa_t sweepOpacity(float behindDeg);
+  /** Row span of the circular sector between two rays, at local row `y`.
+   *  The rays are passed as direction vectors because the caller hoists the
+   *  trigonometry out of the row loop. Requires a sector of at most 180 deg:
+   *  that is what makes the sector convex, and therefore what makes the
+   *  intersection with a row a single interval. */
+  static bool sectorRowSpan(float d0x, float d0y, float d1x, float d1y,
+                            int32_t y, int32_t *xlo, int32_t *xhi);
+  /** Bounding rects of the wedge swept from `fromDeg` to `toDeg` (including
+   *  the tail behind both), banded by row so they hug the wedge. */
+  void buildSweepRegions(float fromDeg, float toDeg);
+  /** Restore the background over the clip region and composite the beam into
+   *  it, writing straight into the layer's buffer. Returns false if the layer
+   *  is not the plain RGB565 framebuffer this knows how to write, in which case
+   *  the caller falls back to lv_draw_image. */
+  bool compositeBackground(lv_layer_t *layer);
 
   void buildDrawOrder();
   void seedStaticBlockers();
@@ -172,10 +230,28 @@ class RadarView {
   // Symbol box + label box per aircraft, this frame and last.
   static constexpr size_t kMaxDirty = kMaxAircraft * 2;
   // How many separate invalid areas to hand LVGL. Each costs a full draw pass
-  // with a fixed overhead of ~5 ms on top of its area-proportional cost, so
-  // this trades clipping tightness against pass count. Measured at 6-7
-  // aircraft: 2 regions => 8.0 fps, 4 => 11.6 fps, 8 => 9.9 fps.
+  // with a fixed overhead on top of its area-proportional cost, so this trades
+  // clipping tightness against pass count. Measured at 6-7 aircraft, before the
+  // legend and per-segment culling below cut the fixed part: 2 regions => 8.0
+  // fps, 4 => 11.6 fps, 8 => 9.9 fps. The sweep needs its own bands on top,
+  // and LVGL only merges invalid areas when doing so *shrinks* them, so these
+  // two budgets add rather than compete.
   static constexpr size_t kMaxRegions = 4;
+  // The swept wedge is banded by row before being handed over, because a wedge
+  // fits its own bounding box badly. Dead area against the true wedge, measured
+  // over a full revolution by reportBandOverhead() in tests/host:
+  //
+  //   bands   2      3      4      5      6      8
+  //   mean    1.57x  1.43x  1.34x  1.28x  1.24x  1.18x
+  //   worst   1.87x  1.59x  1.44x  1.36x  1.30x  1.22x
+  //
+  // Four is where the curve flattens: going to eight buys 14% of the wedge's
+  // pixels back and costs four more draw passes to do it.
+  static constexpr size_t kSweepBands = 4;
+  // Above this many rects, bucket by position before the exact pairwise merge.
+  // See invalidateDirty(): the exact merge is O(n^3) and n runs to 4*kMaxAircraft.
+  static constexpr size_t kMergeExactLimit = 24;
+  static constexpr size_t kMergeGrid = 4;  // kMergeGrid^2 buckets
   Rect dirty_[kMaxDirty];
   size_t dirtyCount_ = 0;
   Rect prevDirty_[kMaxDirty];
@@ -186,6 +262,20 @@ class RadarView {
   bool hasPainted_ = false;
   // The region currently being painted, in local coordinates.
   Rect clip_ = {0, 0, 0, 0};
+
+  // Leading edge of the beam, and where it was when the buffer was last
+  // painted. The gap between the two is what has to be repainted, so they are
+  // separate: a frame the paint gate skipped still has to be caught up on.
+  float sweepDeg_ = 0.0f;
+  float sweepPaintedDeg_ = 0.0f;
+  uint32_t sweepStepMs_ = 0;
+  bool sweepRunning_ = false;
+  Rect sweepRegion_[kSweepBands];
+  size_t sweepRegionCount_ = 0;
+  // Last painted flare level per draw-order slot. Only meaningful while the
+  // content is unchanged, which is exactly when it is read -- a content frame
+  // repaints every symbol anyway.
+  uint8_t litPainted_[kMaxAircraft] = {0};
 
   volatile bool pendingClick_ = false;
   float pendingEast_ = 0.0f;

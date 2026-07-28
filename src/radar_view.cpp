@@ -32,6 +32,57 @@ constexpr LegendGeom kLegend = [] {
                     RadarView::kSize - 2,  bot + 6};
 }();
 
+constexpr float kDeg2Rad = 3.14159265358979f / 180.0f;
+
+// The three intensities the beam is made of, all 0..255.
+//   kBeamPeak  the wedge, at its brightest. Low on purpose: it passes over
+//              range rings and trails and must not compete with them.
+//   kEdgeOpa   the leading slice, which is what reads as "a beam" rather than
+//              as the bright end of a gradient.
+//   kFlarePeak how far a blip is pulled towards the beam colour as it is
+//              crossed. Half is about the limit before the altitude colour --
+//              the actual information -- stops being readable.
+constexpr float kBeamPeak = 92.0f;
+constexpr uint32_t kEdgeOpa = 170;
+constexpr float kFlarePeak = 140.0f;
+// Below this a ray is treated as exactly horizontal, which is a separate case
+// in sectorRowSpan() because the row constraint stops being solvable for x.
+constexpr float kRayEps = 1e-6f;
+
+/** Blend `n` RGB565 pixels of `src` towards a fixed colour and write to `dst`.
+ *
+ *  The colour and its alpha are constant for a whole angular slice of the beam,
+ *  so the caller pre-multiplies them once and this loop is three multiplies and
+ *  a shift per pixel. Alpha is on a 0..256 scale, not 0..255, so that `inv`
+ *  and `a` sum to exactly 256 and the shift is exact at both ends -- on a 5-bit
+ *  channel a rounding error is a visible band. */
+inline void blendSpan(uint16_t *dst, const uint16_t *src, int32_t n, uint32_t fr,
+                      uint32_t fg, uint32_t fb, uint32_t inv) {
+  for (int32_t i = 0; i < n; ++i) {
+    const uint32_t s = src[i];
+    const uint32_t r = ((((s >> 11) & 0x1F) * inv) + fr) >> 8;
+    const uint32_t g = ((((s >> 5) & 0x3F) * inv) + fg) >> 8;
+    const uint32_t b = (((s & 0x1F) * inv) + fb) >> 8;
+    dst[i] = static_cast<uint16_t>((r << 11) | (g << 5) | b);
+  }
+}
+
+/** Wrap to [0, 360). */
+inline float wrapDeg(float deg) {
+  deg = fmodf(deg, 360.0f);
+  return deg < 0.0f ? deg + 360.0f : deg;
+}
+
+/** Mix `fg` into `bg` by `mix`/255. lv_color_mix() is not public API in LVGL 9,
+ *  and this is the whole of it. */
+inline lv_color_t mixColor(lv_color_t fg, lv_color_t bg, uint8_t mix) {
+  const uint32_t inv = 255u - mix;
+  return lv_color_make(
+      static_cast<uint8_t>((fg.red * mix + bg.red * inv) / 255u),
+      static_cast<uint8_t>((fg.green * mix + bg.green * inv) / 255u),
+      static_cast<uint8_t>((fg.blue * mix + bg.blue * inv) / 255u));
+}
+
 // Draw a text label straight onto the canvas layer. LVGL only duplicates the
 // text when text_local is set, so we set it and let LVGL copy — that keeps a
 // caller-side stack buffer safe to reuse for the next label.
@@ -218,6 +269,286 @@ uint8_t RadarView::trailBudget(bool selected) const {
   return 3;
 }
 
+// ===== Sweep beam ==========================================================
+
+float RadarView::sweepAngleAt(uint32_t nowMs) {
+  return wrapDeg(360.0f * static_cast<float>(nowMs % kSweepPeriodMs) /
+                 static_cast<float>(kSweepPeriodMs));
+}
+
+float RadarView::degreesBehind(float bearingDeg, float headDeg) {
+  return wrapDeg(headDeg - bearingDeg);
+}
+
+lv_opa_t RadarView::sweepOpacity(float behindDeg) {
+  if (behindDeg < 0.0f || behindDeg > kSweepTailDeg) {
+    return 0;
+  }
+  const float t = 1.0f - behindDeg / kSweepTailDeg;  // 1 at the leading edge
+  // Quadratic rather than linear: a linear ramp reads as a grey triangle, the
+  // squared one as light decaying, which is what a phosphor tube actually does.
+  return static_cast<lv_opa_t>(lroundf(kBeamPeak * t * t));
+}
+
+bool RadarView::sectorRowSpan(float d0x, float d0y, float d1x, float d1y,
+                              int32_t y, int32_t *xlo, int32_t *xhi) {
+  constexpr float kCentre = kSize * 0.5f;
+  const float dy = static_cast<float>(y) + 0.5f - kCentre;
+  const float inside =
+      static_cast<float>(kSweepRadius) * static_cast<float>(kSweepRadius) - dy * dy;
+  if (inside <= 0.0f) {
+    return false;  // the row misses the disc entirely
+  }
+  const float xr = sqrtf(inside);
+  float lo = -xr;
+  float hi = xr;
+
+  // Bearings run clockwise from north and screen y grows downwards, so the
+  // direction of bearing b is (sin b, -cos b) and the cross product
+  // ux*vy - uy*vx is positive exactly when v is clockwise of u. A sector of at
+  // most 180 deg is then the intersection of two half-planes: clockwise of the
+  // trailing ray, and counter-clockwise of the leading one. Each is linear in
+  // x once the row fixes y, so each contributes one bound.
+  //
+  //   clockwise of d0:            d0x*dy - d0y*x >= 0  ->  d0y*x <= d0x*dy
+  if (d0y > kRayEps) {
+    const float bound = d0x * dy / d0y;
+    if (bound < hi) hi = bound;
+  } else if (d0y < -kRayEps) {
+    const float bound = d0x * dy / d0y;
+    if (bound > lo) lo = bound;
+  } else if (d0x * dy < 0.0f) {
+    return false;  // ray is horizontal: the row is wholly on the wrong side
+  }
+  //   counter-clockwise of d1:    x*d1y - dy*d1x >= 0  ->  x*d1y >= dy*d1x
+  if (d1y > kRayEps) {
+    const float bound = dy * d1x / d1y;
+    if (bound > lo) lo = bound;
+  } else if (d1y < -kRayEps) {
+    const float bound = dy * d1x / d1y;
+    if (bound < hi) hi = bound;
+  } else if (-dy * d1x < 0.0f) {
+    return false;
+  }
+
+  if (lo > hi) {
+    return false;
+  }
+  // lo and hi are continuous x offsets from the centre, and the row was solved
+  // for the centre of the row, so the pixel to compare is the one whose centre
+  // lies in the span: pixel x covers x+0.5. Dropping that half pixel biases
+  // every span one column clockwise, which is a whole pixel of smear at the
+  // rim and enough to leave the odd unpainted pixel behind the beam.
+  *xlo = static_cast<int32_t>(ceilf(kCentre + lo - 0.5f));
+  *xhi = static_cast<int32_t>(floorf(kCentre + hi - 0.5f));
+  if (*xlo < 0) *xlo = 0;
+  if (*xhi > kSize - 1) *xhi = kSize - 1;
+  return *xlo <= *xhi;
+}
+
+void RadarView::buildSweepRegions(float fromDeg, float toDeg) {
+  sweepRegionCount_ = 0;
+  if (!kSweepEnabled) {
+    return;
+  }
+
+  // Everything between where the beam was painted and where it is now differs
+  // from the buffer, and so does the whole tail behind both -- the tail's
+  // opacity is a function of distance from the head, so moving the head
+  // rewrites all of it. One wedge covers both.
+  const float span = wrapDeg(toDeg - fromDeg) + kSweepTailDeg;
+  if (span >= 170.0f) {
+    // Past this the sector stops being convex and sectorRowSpan()'s
+    // single-interval assumption fails. Only reachable after a long stall (the
+    // settings wizard, a slow fetch), where a full repaint is right anyway.
+    fullRepaint_ = true;
+    return;
+  }
+  const float b1 = toDeg;
+  const float b0 = wrapDeg(toDeg - span);
+  const float d0x = sinf(b0 * kDeg2Rad), d0y = -cosf(b0 * kDeg2Rad);
+  const float d1x = sinf(b1 * kDeg2Rad), d1y = -cosf(b1 * kDeg2Rad);
+
+  // Grouped into kSweepBands contiguous bands of roughly equal row count. A
+  // wedge is a poor fit for its own bounding box -- a thin diagonal one is
+  // worst, at four or five times its area -- and banding by row is the
+  // subdivision that actually helps. Banding by angle does not: it turns one
+  // bad sliver into several worse ones.
+  //
+  // Two scans rather than a cached row table: kSize rows of extents would be
+  // ~1.8 KB of stack in a function reached from the Arduino loop task, whose
+  // stack is 8 KB in total (see the note in Tracker::mergeSnapshot). The span
+  // solve is a dozen flops.
+  int32_t firstRow = -1;
+  int32_t lastRow = -1;
+  for (int32_t y = 0; y < kSize; ++y) {
+    int32_t lo = 0, hi = 0;
+    if (!sectorRowSpan(d0x, d0y, d1x, d1y, y, &lo, &hi)) {
+      continue;
+    }
+    if (firstRow < 0) firstRow = y;
+    lastRow = y;
+  }
+  if (firstRow < 0) {
+    return;
+  }
+
+  const int32_t rows = lastRow - firstRow + 1;
+  for (size_t band = 0; band < kSweepBands; ++band) {
+    const int32_t y0 = firstRow + static_cast<int32_t>(band) * rows /
+                                      static_cast<int32_t>(kSweepBands);
+    const int32_t y1 = firstRow + static_cast<int32_t>(band + 1) * rows /
+                                      static_cast<int32_t>(kSweepBands) - 1;
+    int32_t x1 = kSize, x2 = -1;
+    for (int32_t y = y0; y <= y1; ++y) {
+      int32_t lo = 0, hi = 0;
+      if (!sectorRowSpan(d0x, d0y, d1x, d1y, y, &lo, &hi)) continue;
+      if (lo < x1) x1 = lo;
+      if (hi > x2) x2 = hi;
+    }
+    if (x2 < x1) {
+      continue;
+    }
+    sweepRegion_[sweepRegionCount_++] = {
+        static_cast<int16_t>(x1), static_cast<int16_t>(y0),
+        static_cast<int16_t>(x2), static_cast<int16_t>(y1)};
+  }
+}
+
+bool RadarView::compositeBackground(lv_layer_t *layer) {
+  lv_draw_buf_t *buf = layer->draw_buf;
+  if (bgCache_ == nullptr || !bgValid_ || buf == nullptr || buf->data == nullptr ||
+      layer->color_format != LV_COLOR_FORMAT_RGB565) {
+    return false;  // caller falls back to lv_draw_image
+  }
+
+  lv_area_t coords;
+  lv_obj_get_coords(obj_, &coords);
+  // The clip region, in screen coordinates, cropped to the view.
+  const int32_t ax1 = LV_MAX(layer->_clip_area.x1, coords.x1);
+  const int32_t ay1 = LV_MAX(layer->_clip_area.y1, coords.y1);
+  const int32_t ax2 = LV_MIN(layer->_clip_area.x2, coords.x2);
+  const int32_t ay2 = LV_MIN(layer->_clip_area.y2, coords.y2);
+  if (ax1 > ax2 || ay1 > ay2) {
+    return true;  // nothing of the view is in this pass
+  }
+
+  const size_t dstStride = buf->header.stride;
+  const size_t srcStride = bgImg_.header.stride;
+  uint8_t *const dstBase = buf->data;
+  const int32_t bufX = layer->buf_area.x1;
+  const int32_t bufY = layer->buf_area.y1;
+
+  // Screen coordinates in, buffer offsets out. buf_area is the whole display in
+  // DIRECT render mode, but going through it rather than assuming that keeps
+  // this correct if the layer is ever a partial one.
+  auto dstAt = [&](int32_t x, int32_t y) -> uint16_t * {
+    return reinterpret_cast<uint16_t *>(
+               dstBase + static_cast<size_t>(y - bufY) * dstStride) +
+           (x - bufX);
+  };
+  auto srcAt = [&](int32_t x, int32_t y) -> const uint16_t * {
+    return reinterpret_cast<const uint16_t *>(
+               bgCache_ + static_cast<size_t>(y - oy_) * srcStride) +
+           (x - ox_);
+  };
+
+  // With the beam off this is only the background restore, which is what the
+  // whole function was before the beam existed: a row-at-a-time copy out of the
+  // cache, clipped to the region LVGL asked for.
+  if (!sweepRunning_ || !kSweepEnabled) {
+    for (int32_t y = ay1; y <= ay2; ++y) {
+      memcpy(dstAt(ax1, y), srcAt(ax1, y), static_cast<size_t>(ax2 - ax1 + 1) * 2);
+    }
+    return true;
+  }
+
+  // The beam is painted as constant-opacity angular slices, so opacity can vary
+  // with angle without an atan2 for every one of ~25 000 pixels. Ray directions
+  // are computed once per slice *boundary*, and neighbouring slices index the
+  // same entry for the edge they share. Deriving that edge twice -- once as one
+  // slice's leading ray, once as the next one's trailing ray -- leaves the two
+  // spans disagreeing by a rounding step, and a pixel in the gap is written by
+  // neither. Two of them, across a full revolution, was what this cost.
+  constexpr int kSlices = 18;
+  constexpr float kSliceDeg = kSweepTailDeg / kSlices;
+  float rayX[kSlices + 1];
+  float rayY[kSlices + 1];
+  for (int i = 0; i <= kSlices; ++i) {
+    const float b = wrapDeg(sweepDeg_ - static_cast<float>(i) * kSliceDeg);
+    rayX[i] = sinf(b * kDeg2Rad);
+    rayY[i] = -cosf(b * kDeg2Rad);
+  }
+
+  // Pass one: restore the background, skipping the span the beam is about to
+  // overwrite anyway. Writing those pixels twice would cost as much again as
+  // the blend itself. Ray 0 is the leading edge and ray kSlices the end of the
+  // tail, so the wedge is bounded by the same two floats its outermost slices
+  // use.
+  //
+  // The skipped span is deliberately one pixel narrower at each end than the
+  // wedge. Pass two rebuilds the same boundary per slice, and while the two
+  // agree to within a rounding step, "within a rounding step" is exactly a
+  // pixel that neither pass writes -- which on screen is a lit pixel left
+  // behind by the beam, forever. Two pixels a row is a rounding error in the
+  // frame budget; a stale one is not.
+  for (int32_t y = ay1; y <= ay2; ++y) {
+    int32_t lo = 0, hi = 0;
+    if (!sectorRowSpan(rayX[kSlices], rayY[kSlices], rayX[0], rayY[0], y - oy_, &lo,
+                       &hi)) {
+      memcpy(dstAt(ax1, y), srcAt(ax1, y), static_cast<size_t>(ax2 - ax1 + 1) * 2);
+      continue;
+    }
+    const int32_t wlo = LV_MAX(lo + ox_, ax1);
+    const int32_t whi = LV_MIN(hi + ox_, ax2);
+    if (wlo > whi) {  // the wedge is on this row but not in this region
+      memcpy(dstAt(ax1, y), srcAt(ax1, y), static_cast<size_t>(ax2 - ax1 + 1) * 2);
+      continue;
+    }
+    memcpy(dstAt(ax1, y), srcAt(ax1, y), static_cast<size_t>(wlo - ax1 + 1) * 2);
+    memcpy(dstAt(whi, y), srcAt(whi, y), static_cast<size_t>(ax2 - whi + 1) * 2);
+  }
+
+  // Pass two: the beam itself, slice by slice.
+  probe::Scope _(probe::kSweep);
+  for (int s = 0; s < kSlices; ++s) {
+    const float behind = (static_cast<float>(s) + 0.5f) * kSliceDeg;
+    // Not skipped when this rounds to zero, tempting though that is: pass one
+    // left the whole wedge unwritten, so the faintest slice is still the only
+    // thing that will put background back under the beam's trailing edge. At
+    // alpha zero the blend below is an exact copy, which is precisely what that
+    // slice needs.
+    const lv_opa_t opa = sweepOpacity(behind);
+    // The leading slice is the beam itself: brighter, and a different colour,
+    // which is what makes it read as an edge rather than as the top of a ramp.
+    const uint16_t col = lv_color_to_u16(
+        theme::c(s == 0 ? theme::kSweepEdge : theme::kSweepBeam));
+    const uint32_t a = s == 0 ? kEdgeOpa : static_cast<uint32_t>(opa);
+    const uint32_t a256 = a + (a >> 7);  // 0..255 -> 0..256, exact at both ends
+    const uint32_t inv = 256u - a256;
+    const uint32_t fr = ((col >> 11) & 0x1F) * a256;
+    const uint32_t fg = ((col >> 5) & 0x3F) * a256;
+    const uint32_t fb = (col & 0x1F) * a256;
+
+    for (int32_t y = ay1; y <= ay2; ++y) {
+      int32_t lo = 0, hi = 0;
+      if (!sectorRowSpan(rayX[s + 1], rayY[s + 1], rayX[s], rayY[s], y - oy_, &lo,
+                         &hi)) {
+        continue;
+      }
+      const int32_t x1 = LV_MAX(lo + ox_, ax1);
+      const int32_t x2 = LV_MIN(hi + ox_, ax2);
+      if (x1 > x2) {
+        continue;
+      }
+      blendSpan(dstAt(x1, y), srcAt(x1, y), x2 - x1 + 1, fr, fg, fb, inv);
+    }
+  }
+  return true;
+}
+
+// ===========================================================================
+
 void RadarView::buildDrawOrder() {
   orderCount_ = 0;
   blockerCount_ = 0;
@@ -241,6 +572,23 @@ void RadarView::buildDrawOrder() {
     p.selected = hasSelection && strcasecmp(selectedHex_, ac.hex) == 0;
     // Glyph nose reaches 9 px; selected scales x1.35 and adds a 15 px halo.
     p.symbolR = p.selected ? 18 : 10;
+
+    // Beam flare. A real PPI brightens a return as the beam crosses it and lets
+    // it decay, and that -- not the wedge -- is what makes a sweep read as a
+    // sweep rather than a rotating shadow. Quantised to 16 levels because the
+    // level is what decides whether the symbol has to be reinvalidated on a
+    // sweep-only frame; at full resolution every blip in the tail would repaint
+    // every frame for a change nobody can see.
+    p.lit = 0;
+    if (sweepRunning_ && kSweepEnabled) {
+      const float bearing = wrapDeg(atan2f(ac.eastNm, ac.northNm) / kDeg2Rad);
+      const float behind = degreesBehind(bearing, sweepDeg_);
+      if (behind <= kSweepTailDeg) {
+        const float t = 1.0f - behind / kSweepTailDeg;
+        const uint32_t flare = static_cast<uint32_t>(lroundf(kFlarePeak * t * t));
+        p.lit = static_cast<uint8_t>((flare & 0xF0u) + (flare >> 4));
+      }
+    }
 
     // Extent of everything this aircraft paints. +2 covers the glyph casing,
     // which is drawn two pixels wider than the core stroke.
@@ -407,6 +755,16 @@ void RadarView::drawTrail(lv_layer_t *layer, const Placed &p) {
     int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
     nmToPixel(ac.trail[idx0].eastNm, ac.trail[idx0].northNm, &x0, &y0);
     nmToPixel(ac.trail[idx1].eastNm, ac.trail[idx1].northNm, &x1, &y1);
+    // Per segment, not per trail: a trail's bounding box is large enough that
+    // testing it as a whole lets a region at one end of it build a draw task
+    // for every segment at the other end, which LVGL then clips away.
+    const Rect seg = {static_cast<int16_t>(LV_MIN(x0, x1) - 1),
+                      static_cast<int16_t>(LV_MIN(y0, y1) - 1),
+                      static_cast<int16_t>(LV_MAX(x0, x1) + 1),
+                      static_cast<int16_t>(LV_MAX(y0, y1) + 1)};
+    if (culled(seg)) {
+      continue;
+    }
     trail.opa = trailOpacity(ac, i, used, p.selected);
     trail.p1.x = x0 + ox_;
     trail.p1.y = y0 + oy_;
@@ -418,7 +776,13 @@ void RadarView::drawTrail(lv_layer_t *layer, const Placed &p) {
 
 void RadarView::drawSymbol(lv_layer_t *layer, const Placed &p) {
   const Aircraft &ac = *p.ac;
-  const lv_color_t color = colorForAircraft(ac);
+  lv_color_t color = colorForAircraft(ac);
+  if (p.lit != 0) {
+    // Towards the beam's own colour rather than to white: white is the
+    // selection, and a flare that reached it would read as "this one is
+    // selected" twelve times a minute.
+    color = mixColor(theme::c(theme::kSweepEdge), color, p.lit);
+  }
   const int32_t x = p.x + ox_;
   const int32_t y = p.y + oy_;
 
@@ -472,8 +836,12 @@ void RadarView::drawSymbol(lv_layer_t *layer, const Placed &p) {
   for (int pass = 0; pass < 2; ++pass) {
     lv_draw_line_dsc_t glyph;
     lv_draw_line_dsc_init(&glyph);
-    glyph.round_start = 1;
-    glyph.round_end = 1;
+    // Round caps only on the visible stroke. LVGL draws each one as a separate
+    // radius-masked fill, which costs a PSRAM allocation and a circle mask for
+    // a 3x3 box; the casing pass alone was half of them, for ends that the fill
+    // pass covers anyway.
+    glyph.round_start = pass == 1;
+    glyph.round_end = pass == 1;
     glyph.opa = LV_OPA_COVER;
     glyph.color = pass == 0 ? theme::c(theme::kRadarBg) : color;
     glyph.width = pass == 0 ? coreW + 2 : coreW;
@@ -791,25 +1159,10 @@ void RadarView::collectDirty() {
   }
 }
 
-void RadarView::invalidateDirty() {
+void RadarView::invalidateDirty(bool contentChanged) {
   lv_area_t coords;
   lv_obj_get_coords(obj_, &coords);
 
-  // Both sets: last frame's rects to restore the background under where things
-  // were, this frame's to draw where they now are.
-  Rect region[kMaxDirty * 2];
-  size_t n = 0;
-  for (size_t i = 0; i < prevDirtyCount_; ++i) region[n++] = prevDirty_[i];
-  for (size_t i = 0; i < dirtyCount_; ++i) region[n++] = dirty_[i];
-  if (n == 0) {
-    return;
-  }
-
-  // Merge down to a handful of regions before invalidating. LVGL renders each
-  // invalid area as its own pass, and each pass re-runs the whole draw handler
-  // -- including setting up the background image draw. Measured at ~5-8 ms per
-  // pass, so two dozen tight rects cost far more than a few loose ones: going
-  // from 24 regions to 4 was worth more than the tighter clipping it gave up.
   auto area = [](const Rect &r) -> int32_t {
     return (static_cast<int32_t>(r.x2) - r.x1 + 1) * (static_cast<int32_t>(r.y2) - r.y1 + 1);
   };
@@ -818,7 +1171,68 @@ void RadarView::invalidateDirty() {
             a.x2 > b.x2 ? a.x2 : b.x2, a.y2 > b.y2 ? a.y2 : b.y2};
   };
 
-  while (n > kMaxRegions) {
+  Rect region[kMaxDirty * 2 + kSweepBands];
+  size_t n = 0;
+  if (contentChanged) {
+    // Both sets: last frame's rects to restore the background under where
+    // things were, this frame's to draw where they now are.
+    for (size_t i = 0; i < prevDirtyCount_; ++i) region[n++] = prevDirty_[i];
+    for (size_t i = 0; i < dirtyCount_; ++i) region[n++] = dirty_[i];
+  } else {
+    // Nothing moved, so the only aircraft that differ from what is already in
+    // the buffer are the ones whose beam flare stepped. Everything else in the
+    // view is already correct and repainting it would be the sweep paying for
+    // the whole frame, twelve times a second.
+    for (size_t i = 0; i < orderCount_ && n < kMaxAircraft; ++i) {
+      const Placed &p = order_[i];
+      if (p.lit == litPainted_[i]) {
+        continue;
+      }
+      const int16_t r = static_cast<int16_t>(p.symbolR + 2);
+      region[n++] = {static_cast<int16_t>(p.x - r), static_cast<int16_t>(p.y - r),
+                     static_cast<int16_t>(p.x + r), static_cast<int16_t>(p.y + r)};
+    }
+  }
+  for (size_t i = 0; i < sweepRegionCount_; ++i) region[n++] = sweepRegion_[i];
+  if (n == 0) {
+    return;
+  }
+
+  // Merge down to a handful of regions before invalidating. LVGL renders each
+  // invalid area as its own pass, and each pass re-runs the whole draw handler
+  // -- including restoring the background. Measured at ~5-8 ms per pass, so two
+  // dozen tight rects cost far more than a few loose ones: going from 24
+  // regions to 4 was worth more than the tighter clipping it gave up.
+  //
+  // The exact merge below is O(n^3), which is invisible at the 28 rects a
+  // half-dozen aircraft produce and ruinous at the 132 a full sky plus the
+  // sweep can: ~500 000 pair tests, tens of milliseconds, inside the frame it
+  // is trying to make cheaper. Bucketing by position first caps n at 16 for a
+  // pass that is linear in the rect count. A bucket is a quarter of the view
+  // across, so this gives up very little -- and only where the exact merge was
+  // never affordable in the first place.
+  if (n > kMergeExactLimit) {
+    Rect cell[kMergeGrid * kMergeGrid];
+    bool used[kMergeGrid * kMergeGrid] = {false};
+    for (size_t i = 0; i < n; ++i) {
+      const int32_t cx = (static_cast<int32_t>(region[i].x1) + region[i].x2) / 2;
+      const int32_t cy = (static_cast<int32_t>(region[i].y1) + region[i].y2) / 2;
+      const int32_t gx = LV_CLAMP(0, cx * static_cast<int32_t>(kMergeGrid) / kSize,
+                                  static_cast<int32_t>(kMergeGrid) - 1);
+      const int32_t gy = LV_CLAMP(0, cy * static_cast<int32_t>(kMergeGrid) / kSize,
+                                  static_cast<int32_t>(kMergeGrid) - 1);
+      const size_t c = static_cast<size_t>(gy) * kMergeGrid + static_cast<size_t>(gx);
+      cell[c] = used[c] ? merged(cell[c], region[i]) : region[i];
+      used[c] = true;
+    }
+    n = 0;
+    for (size_t c = 0; c < kMergeGrid * kMergeGrid; ++c) {
+      if (used[c]) region[n++] = cell[c];
+    }
+  }
+
+  const size_t maxRegions = kMaxRegions + (sweepRegionCount_ > 0 ? kSweepBands : 0);
+  while (n > maxRegions) {
     // Cheapest pair to merge: the one adding least dead area.
     size_t bi = 0, bj = 1;
     int32_t best = INT32_MAX;
@@ -884,6 +1298,17 @@ void RadarView::paintLabels(lv_layer_t *layer) {
 }
 
 void RadarView::drawLegend(lv_layer_t *layer) {
+  // The legend is static but is not baked into the background cache, because it
+  // has to paint after the symbols for aircraft never to obscure it. That left
+  // it redrawing in full on every pass: a translucent rounded backdrop over
+  // ~8 800 px (a masked read-modify-write, the most expensive shape here) plus
+  // 40 gradient segments and six labels, three or four times per paint, almost
+  // always for a region nowhere near it.
+  if (culled({static_cast<int16_t>(kLegend.x1), static_cast<int16_t>(kLegend.y1),
+              static_cast<int16_t>(kLegend.x2), static_cast<int16_t>(kLegend.y2)})) {
+    return;
+  }
+
   const int32_t height = kLegend.barBot - kLegend.barTop;
 
   // Backdrop for legibility. Its extent is also what seedStaticBlockers()
@@ -936,38 +1361,75 @@ void RadarView::redraw() {
     renderBackgroundCache();
   }
 
+  // The beam steps on its own clock, independently of whether any aircraft
+  // moved. Derived from the tick rather than accumulated, so a frame the loop
+  // was too busy to serve slips the beam instead of slowing it down.
+  const uint32_t now = lv_tick_get();
+  const bool wasRunning = sweepRunning_;
+  const bool sweepStep =
+      kSweepEnabled && (!wasRunning || now - sweepStepMs_ >= kSweepStepMs);
+  if (sweepStep) {
+    sweepDeg_ = sweepAngleAt(now);
+    sweepRunning_ = true;  // read by buildDrawOrder() below, for the blip flare
+  }
+
   // Solve the frame here; the actual painting happens in onDraw(), which LVGL
   // calls back during lv_timer_handler() once per invalidated region.
   buildDrawOrder();
 
-  // Nothing moved by a whole pixel? Then there is nothing to paint. At 25 nm
-  // range a 450 kt aircraft crosses about one pixel per second, so without this
-  // the view repaints ten-plus times per pixel of real movement. That cost two
-  // visible artefacts: the label solver re-ran every frame and could pick a
-  // different anchor each time (labels flickering), and the repaints starved
-  // lv_timer_handler, so the info panel's marquee animation stepped
-  // irregularly. Both are fixed by simply not painting an identical frame.
+  // Nothing moved by a whole pixel? Then there is nothing to paint *of the
+  // aircraft*. At 25 nm range a 450 kt aircraft crosses about one pixel per
+  // second, so without this the view repaints ten-plus times per pixel of real
+  // movement. That cost two visible artefacts: the label solver re-ran every
+  // frame and could pick a different anchor each time (labels flickering), and
+  // the repaints starved lv_timer_handler, so the info panel's marquee
+  // animation stepped irregularly.
+  //
+  // The sweep does not change that reasoning, it just splits it in two. A sweep
+  // step still has to paint, but only the wedge -- and crucially it must not
+  // re-run the anchor solver, or the beam would bring the label flicker back
+  // with it at twelve frames a second.
   const uint32_t sig = paintSignature();
-  if (!fullRepaint_ && !trailsChanged_ && hasPainted_ && sig == lastPaintSig_) {
+  const bool contentChanged =
+      fullRepaint_ || trailsChanged_ || !hasPainted_ || sig != lastPaintSig_;
+  if (!contentChanged && !sweepStep) {
     return;
   }
   lastPaintSig_ = sig;
   hasPainted_ = true;
 
-  // Only the frames that actually paint pay for the anchor solver.
-  probe::Scope solveScope(probe::kTasks);
-  layoutLabels();
-  collectDirty();
+  if (sweepStep) {
+    // From where the beam was when the buffer was last painted, not from where
+    // it was last frame: a frame the gate above skipped never reached the
+    // screen, and the pixels it would have written are still stale.
+    buildSweepRegions(wasRunning ? sweepPaintedDeg_ : sweepDeg_, sweepDeg_);
+    sweepStepMs_ = now;
+    sweepPaintedDeg_ = sweepDeg_;
+  } else {
+    sweepRegionCount_ = 0;
+  }
+
+  if (contentChanged) {
+    // Only the frames that move an aircraft pay for the anchor solver.
+    probe::Scope solveScope(probe::kTasks);
+    layoutLabels();
+    collectDirty();
+  }
 
   if (fullRepaint_) {
     fullRepaint_ = false;
     lv_obj_invalidate(obj_);
   } else {
-    invalidateDirty();
+    invalidateDirty(contentChanged);
   }
   trailsChanged_ = false;
-  memcpy(prevDirty_, dirty_, dirtyCount_ * sizeof(Rect));
-  prevDirtyCount_ = dirtyCount_;
+  if (contentChanged) {
+    memcpy(prevDirty_, dirty_, dirtyCount_ * sizeof(Rect));
+    prevDirtyCount_ = dirtyCount_;
+  }
+  for (size_t i = 0; i < orderCount_; ++i) {
+    litPainted_[i] = order_[i].lit;
+  }
   probe::countFrame();
 }
 
@@ -1002,21 +1464,35 @@ void RadarView::paintDirect(lv_layer_t *layer) {
            static_cast<int16_t>(layer->_clip_area.x2 - ox_),
            static_cast<int16_t>(layer->_clip_area.y2 - oy_)};
 
-  if (bgValid_) {
-    // Restores the static chrome and erases the previous frame in one pass.
-    // LVGL clips this to the invalid region, so it costs only what changed.
-    lv_draw_image_dsc_t img;
-    lv_draw_image_dsc_init(&img);
-    img.src = &bgImg_;
-    img.opa = LV_OPA_COVER;
-    lv_draw_image(layer, &img, &coords);
+  // Restores the static chrome and erases the previous frame in one pass, and
+  // composites the beam into the same pass -- which is the whole reason it is
+  // done by hand rather than with lv_draw_image. With LV_USE_OS none, an
+  // lv_draw_*() call only queues a task; the queue is not rasterised until
+  // after this handler returns. So anything written directly here lands
+  // underneath everything drawn through LVGL below, which is exactly the layer
+  // order the beam wants: over the rings, under the aircraft.
+  if (!compositeBackground(layer)) {
+    if (bgValid_) {
+      lv_draw_image_dsc_t img;
+      lv_draw_image_dsc_init(&img);
+      img.src = &bgImg_;
+      img.opa = LV_OPA_COVER;
+      lv_draw_image(layer, &img, &coords);
+    }
   }
 
   for (size_t i = 0; i < orderCount_; ++i) {
     if (!culled(order_[i].box)) drawTrail(layer, order_[i]);
   }
   for (size_t i = 0; i < orderCount_; ++i) {
-    if (!culled(order_[i].box)) drawSymbol(layer, order_[i]);
+    // Against the symbol's own box, not order_[i].box -- that one is stretched
+    // to cover the trail, and testing symbols against it builds a glyph's six
+    // line tasks for every region the trail happens to reach.
+    const Placed &p = order_[i];
+    const int16_t r = static_cast<int16_t>(p.symbolR + 2);
+    const Rect symBox = {static_cast<int16_t>(p.x - r), static_cast<int16_t>(p.y - r),
+                         static_cast<int16_t>(p.x + r), static_cast<int16_t>(p.y + r)};
+    if (!culled(symBox)) drawSymbol(layer, p);
   }
   paintLabels(layer);
   // Stays live rather than baked into the cache: it is drawn last so aircraft

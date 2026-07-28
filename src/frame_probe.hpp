@@ -78,6 +78,39 @@
  *   2. LV_LABEL_LONG_SCROLL_CIRCULAR over LV_SIZE_CONTENT blocks re-runs the
  *      flex layout on every animation step. Eight of them cost ~80 ms per
  *      lv_timer_handler call and took `loop` from ~200/s to ~12/s.
+ *
+ * ---------------------------------------------------------------------------
+ * THE SWEEP BEAM changes what these numbers mean, because it is the first
+ * thing here that has to paint on a clock rather than on a change. Four cuts
+ * were made to pay for it, all of them things that were being redrawn for no
+ * reason rather than things that were slow:
+ *
+ *   - The legend was repainting in full on every pass -- a translucent rounded
+ *     backdrop over ~8 800 px, which is a masked read-modify-write and the
+ *     most expensive shape in the view, plus 40 gradient segments and six
+ *     labels -- almost always for a region nowhere near it. Now culled.
+ *   - Symbols were culled against a box stretched to include their trail, so a
+ *     region touching one end of a long trail built six line tasks for a glyph
+ *     at the other end. Now culled against the glyph's own box.
+ *   - Trails were culled per trail rather than per segment, with the same
+ *     effect one level down.
+ *   - Round line caps are LVGL radius-masked fills: a PSRAM allocation and a
+ *     circle mask each, twelve per aircraft per pass. The casing pass's six
+ *     are covered by the fill pass anyway, and are gone.
+ *
+ * `clear` is retired: the background restore is now a direct row memcpy out of
+ * the cache, inside the draw handler, and so lands in `rast` with everything
+ * else. `sweep` is live for the first time and measures only the beam's own
+ * blend, nested inside `rast` -- so it is a component of that number, not an
+ * addition to it. The blend is a read-blend-write between two PSRAM buffers,
+ * which is to say it is bandwidth, not arithmetic: judge it against the ~4.7
+ * Mpx/s that the memcpy figure above implies, and expect roughly 25 kpx per
+ * step at the defaults in radar_view.hpp.
+ *
+ * `loop` is still the number to judge the system by. The beam paints ~12.5
+ * times a second where the aircraft alone painted ~6, so it is spending real
+ * budget; if `loop` collapses, kSweepStepMs and kSweepTailDeg are the two
+ * dials, and both are linear.
  * ---------------------------------------------------------------------------
  */
 
@@ -88,10 +121,10 @@
 namespace probe {
 
 enum Slot : uint8_t {
-  kClear = 0,  // canvas clear (fill_bg, later the background restore)
-  kSweep,      // sweep task creation
-  kTasks,      // trails + symbols + labels task creation
-  kRaster,     // lv_canvas_finish_layer -- where the drawing actually happens
+  kClear = 0,  // unused since the background restore became a direct memcpy
+  kSweep,      // the beam's blend, nested inside kRaster
+  kTasks,      // label anchor solver + trail/symbol/label task creation
+  kRaster,     // the draw handler -- where the drawing actually happens
   kLvgl,       // lv_timer_handler: layout, widget redraw, canvas blit
   kPresent,    // esp_lcd_panel_draw_bitmap (cache write-back + arm the flip)
   kVsync,      // waitVsync -- idle time, NOT cost; kept separate so it does not
