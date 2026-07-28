@@ -535,6 +535,51 @@ static void benchSram() {
 }
 #endif
 
+#if ATC_BENCH
+/**
+ * PSRAM memcpy throughput against working-set size.
+ *
+ * The point is Tier 1 of PERFORMANCE.md, specifically the half of it that
+ * proposes doubling the data cache from 32 KB to 64 KB. That is only worth
+ * anything if the working sets we actually stream are near the cache size --
+ * if they are 400 KB, twice a 32 KB cache is still nowhere near enough and the
+ * setting cannot help, whatever it costs to change.
+ *
+ * Sweeping the size maps where the cliff is and how steep it is, which answers
+ * that for this workload without building anything. Sizes straddle the 32 KB
+ * cache deliberately: the last size that fits, the first that does not, and the
+ * scale the renderer actually works at.
+ */
+static void benchCacheCurve() {
+  constexpr size_t kMax = 448u * 448u * 2u;
+  uint8_t *a = static_cast<uint8_t *>(heap_caps_malloc(kMax, MALLOC_CAP_SPIRAM));
+  uint8_t *b = static_cast<uint8_t *>(heap_caps_malloc(kMax, MALLOC_CAP_SPIRAM));
+  if (a == nullptr || b == nullptr) {
+    Log.println("[curve] alloc failed");
+    heap_caps_free(a);
+    heap_caps_free(b);
+    return;
+  }
+  static const size_t kSizes[] = {4096,   8192,   16384,  24576,  32768,
+                                  49152,  65536,  131072, 262144, kMax};
+  Log.print("[curve] psram memcpy MB/s by working set:");
+  for (size_t i = 0; i < sizeof(kSizes) / sizeof(kSizes[0]); ++i) {
+    const size_t n = kSizes[i];
+    // Same total bytes moved at every size, so timer resolution and loop
+    // overhead do not masquerade as a throughput difference.
+    const int reps = static_cast<int>(kMax * 4 / n);
+    const uint32_t t = micros();
+    for (int r = 0; r < reps; ++r) memcpy(b, a, n);
+    const uint32_t dt = micros() - t;
+    const float mb = static_cast<float>(n) * reps / (1024.0f * 1024.0f);
+    Log.printf(" %uK=%.0f", static_cast<unsigned>(n / 1024), mb * 1e6f / dt);
+  }
+  Log.println("");
+  heap_caps_free(a);
+  heap_caps_free(b);
+}
+#endif
+
 static bool initLvgl() {
   lv_init();
   lv_tick_set_cb(lvTickCb);
@@ -643,6 +688,7 @@ void setup() {
 #if ATC_BENCH
   benchPsram();
   benchSram();
+  benchCacheCurve();
 #endif
   Log.println("Ready.");
 }
