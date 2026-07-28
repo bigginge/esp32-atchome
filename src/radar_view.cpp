@@ -570,7 +570,61 @@ bool RadarView::buildBackgroundRle() {
   return true;
 }
 
+#if ATC_BG_RLE_AB
+
+void RadarView::abReport(unsigned long nowMs) {
+  static unsigned long last = 0;
+  if (last == 0) {
+    last = nowMs;
+    return;
+  }
+  if (nowMs - last < 10000) {
+    return;
+  }
+  last = nowMs;
+  if (abN_[0] == 0 || abN_[1] == 0) {
+    return;
+  }
+  const double psram = static_cast<double>(abSum_[0]) / abN_[0];
+  const double rle = static_cast<double>(abSum_[1]) / abN_[1];
+  Log.printf("[bgab] psram=%.0fus n=%lu  rle=%.0fus n=%lu  delta=%+.1f%%\n", psram,
+             static_cast<unsigned long>(abN_[0]), rle,
+             static_cast<unsigned long>(abN_[1]), (rle - psram) / psram * 100.0);
+  abSum_[0] = abSum_[1] = 0;
+  abN_[0] = abN_[1] = 0;
+}
+
 bool RadarView::compositeBackground(lv_layer_t *layer) {
+  // Only meaningful once both paths are actually available; before that the
+  // RLE arm would silently be the memcpy arm and the comparison would read as
+  // a dead heat rather than as "not measured".
+  if (bgRle_ == nullptr || bgLine_ == nullptr) {
+    return compositeBackgroundImpl(layer);
+  }
+  if (++abCalls_ % kAbBlock == 0) {
+    abArm_ = !abArm_;
+  }
+  const bool saved = bgRleValid_;
+  bgRleValid_ = abArm_;
+  const uint32_t t0 = micros();
+  const bool r = compositeBackgroundImpl(layer);
+  const uint32_t dt = micros() - t0;
+  bgRleValid_ = saved;
+  abSum_[abArm_ ? 1 : 0] += dt;
+  abN_[abArm_ ? 1 : 0]++;
+  abReport(millis());
+  return r;
+}
+
+#else
+
+bool RadarView::compositeBackground(lv_layer_t *layer) {
+  return compositeBackgroundImpl(layer);
+}
+
+#endif  // ATC_BG_RLE_AB
+
+bool RadarView::compositeBackgroundImpl(lv_layer_t *layer) {
   lv_draw_buf_t *buf = layer->draw_buf;
   if (bgCache_ == nullptr || !bgValid_ || buf == nullptr || buf->data == nullptr ||
       layer->color_format != LV_COLOR_FORMAT_RGB565) {

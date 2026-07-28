@@ -5,6 +5,13 @@
 
 #include <lvgl.h>
 
+/** Build with -DATC_BG_RLE_AB=1 to interleave the two background sources and
+ *  print their per-call costs. Off in shipping builds: it deliberately spends
+ *  half the frames on the slower path. */
+#ifndef ATC_BG_RLE_AB
+#define ATC_BG_RLE_AB 0
+#endif
+
 class RadarView {
  public:
   static constexpr int32_t kSize = theme::layout::kRadarSize;
@@ -195,6 +202,23 @@ class RadarView {
    *  is not the plain RGB565 framebuffer this knows how to write, in which case
    *  the caller falls back to lv_draw_image. */
   bool compositeBackground(lv_layer_t *layer);
+  bool compositeBackgroundImpl(lv_layer_t *layer);
+
+#if ATC_BG_RLE_AB
+  /** Interleaved A/B of the background source, for when a number has to be
+   *  trusted. Flipping the arm *within* one session is the only way to compare
+   *  them under identical traffic: aircraft count drives every timing on this
+   *  board hard enough that two separate flashes can disagree by 50 points in
+   *  either direction purely by luck of the draw (see the A/B TRAP note in
+   *  frame_probe.hpp). Alternating every kAbBlock calls puts both arms in the
+   *  same air, the same minute, the same thermal state. */
+  static constexpr uint32_t kAbBlock = 64;
+  void abReport(unsigned long nowMs);
+  uint64_t abSum_[2] = {0, 0};   // [0] = PSRAM memcpy, [1] = SRAM RLE
+  uint32_t abN_[2] = {0, 0};
+  uint32_t abCalls_ = 0;
+  bool abArm_ = false;
+#endif
 
   void buildDrawOrder();
   void seedStaticBlockers();

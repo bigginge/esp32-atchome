@@ -251,6 +251,32 @@ Restoring from an RLE rather than from `bgCache_`:
 It is pixel-identical to the current output, so `tests/host` continues to hold
 unchanged — which is what makes it a safe change to a load-bearing path.
 
+> **Done, and measured 2026-07-28.** 401 408 B of PSRAM became 36 304 B of
+> internal SRAM — 11.1x, close to the 40 KB estimated above. Measured with an
+> *interleaved* A/B (`-DATC_BG_RLE_AB=1`, which flips the background source
+> every 64 calls inside one session, so both arms see identical traffic):
+> **`compositeBackground()` is 12.8% faster**, 17/17 windows favouring the RLE
+> over ~4 150 calls per arm, sign-test p ≈ 8e-6. Solid.
+>
+> **But this section over-sold it, and so did the first attempt to measure it.**
+> Flash-to-flash comparison suggested +13.7% fps and −27% on the restore; both
+> were inflated by the aircraft-count confound, and the interleaved number is
+> the honest one. `compositeBackground()` is ~6.0 ms of the ~15.8 ms `rast`
+> pass, i.e. ~25% of the frame, so **12.8% of it is worth ~3% end to end** —
+> not the headline "highest-value code change" this section claims.
+>
+> Two things it did *not* deliver. The 450 KB of PSRAM is **not** freed:
+> `bgCache_` has to stay allocated because `renderBackgroundCache()` rasterises
+> into it through `lv_canvas` and the RLE is re-encoded from it on every range
+> change. And the plan missed that the beam blends *over* the background, so
+> `blendSpan` needs random-access source pixels; pass two decodes into an SRAM
+> line buffer first, which is why `sweep` also improved ~9%.
+>
+> The useful discovery is what it leaves behind. `compositeBackground()` is only
+> ~38% of `rast`; the other ~62% — roughly **40% of the whole frame** — is
+> content drawing, the trails, symbols and labels, and *nothing in this document
+> targets it*. That is now the largest single item in the budget.
+
 ### Two tuning constants are stale
 
 `kMaxRegions = 4` carries its own disclaimer: *"Measured at 6-7 aircraft,
