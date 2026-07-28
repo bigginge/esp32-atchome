@@ -135,9 +135,35 @@ them. Routes out, cheapest first:
   buys full control of sdkconfig *and* the compiler flags.
 - **pioarduino** (the maintained PlatformIO fork) supports `custom_sdkconfig`
   for arduino-esp32 3.x by driving the lib-builder itself.
-- There is a `high_perf/` variant in
+- ~~There is a `high_perf/` variant in
   [`arduino-esp32-sdk`](https://github.com/esp-arduino-libs/arduino-esp32-sdk)
-  worth evaluating before anything more drastic.
+  worth evaluating before anything more drastic.~~ **Tried 2026-07-28. Dead
+  end — see below.**
+
+> **The `high_perf` route: right idea, blocked.** It is exactly what Tier 1
+> wants and needs no toolchain at all — prebuilt libraries with `-O2` on the IDF
+> itself (which `compiler.optimization_flags` cannot reach, since those are
+> shipped compiled) and the ESP32-S3 data cache line raised 32 B → 64 B. Install
+> is a zip dropped into `packages/esp32`.
+>
+> It is published for core **3.2.0** and **3.1.1** only. Verified three ways: the
+> repo root holds just `debug/` and `high_perf/`; that directory tops out at
+> 3.1.1; and a probe of `dl.espressif.com/AE/esp-arduino-libs/esp32-<v>-h.zip`
+> across 3.2.0 → 3.3.11 returns 200 for `3.2.0-h` alone. We are on 3.3.11.
+>
+> So it costs a core downgrade, and **this project does not run on 3.2.0**. It
+> compiles clean, then boot-loops: `TG1WDT_SYS_RST`, hanging in `create()` and
+> never reaching `Ready`. Checked against the pre-RLE commit too, which
+> boot-loops identically — so it is the core, not anything on this branch. Not
+> investigated further; the payoff did not justify debugging a downgrade.
+>
+> Which leaves only the full ESP-IDF migration as a route to the 64-byte cache
+> line, at ~3 GB of toolchain on a machine that has neither Python nor IDF. And
+> the cache line is now the *sole* surviving mechanism in Tier 1: 80 MHz was
+> already set, and the 64 KB cache is measured useless here (see the cliff
+> curve). Its benefit remains inferred, from a 64-byte-burst argument in the
+> same family as the three claims in this document that checking has already
+> falsified — each one optimistic.
 
 If the check above says 40 MHz or 32 B, **this is the 2x-to-4x and nothing
 else in this document comes close.** Everything below is scaled by its outcome.
