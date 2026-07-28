@@ -405,6 +405,30 @@ static void applySettingsChange() {
 
 #if ATC_BENCH
 /**
+ * The actual CPU clock, counted rather than asked for.
+ *
+ * Every "cycles per pixel" figure in PERFORMANCE.md is quoted against 240 MHz,
+ * and both the board default (`build.f_cpu`) and the shipped sdkconfig
+ * (`CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240`, `CONFIG_PM_ENABLE` unset) agree. But
+ * `build.f_cpu` is only a -DF_CPU define and the sdkconfig is what the
+ * *precompiled* libraries were built with -- exactly the pair of assumptions
+ * that turned out to be wrong about the PSRAM clock. So count CCOUNT against
+ * micros() and read the answer off the silicon.
+ */
+static void reportClocks() {
+  const uint32_t c0 = ESP.getCycleCount();
+  const uint32_t t0 = micros();
+  delay(200);
+  const uint32_t c1 = ESP.getCycleCount();
+  const uint32_t t1 = micros();
+  const double mhz = static_cast<double>(c1 - c0) / static_cast<double>(t1 - t0);
+  Log.printf("[clk] api=%u MHz  measured=%.1f MHz  xtal=%u MHz  apb=%u Hz\n",
+             static_cast<unsigned>(getCpuFrequencyMhz()), mhz,
+             static_cast<unsigned>(getXtalFrequencyMhz()),
+             static_cast<unsigned>(getApbFrequency()));
+}
+
+/**
  * What PSRAM bandwidth is actually available with the LCD scanning out?
  *
  * The panel reads 800*480*2 B at ~24 Hz = ~18 MB/s continuously through the
@@ -686,6 +710,7 @@ void setup() {
   Log.printf("[mem] free internal after init: %u B\n",
                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
 #if ATC_BENCH
+  reportClocks();
   benchPsram();
   benchSram();
   benchCacheCurve();
