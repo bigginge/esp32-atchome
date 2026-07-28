@@ -455,6 +455,84 @@ static void benchPsram() {
   heap_caps_free(a);
   heap_caps_free(b);
 }
+
+/**
+ * The same shapes against *internal* SRAM, and against PSRAM at the same size.
+ *
+ * This is the comparison the probe harness never had. Every conclusion in
+ * PERFORMANCE.md rests on "the render path is memory-bound, not compute-bound",
+ * and that has only ever been inferred -- from blendSpan running at roughly
+ * memcpy speed. Running identical loops over both memories settles it directly,
+ * and the ratio bounds how much *any* change to the memory system can be worth:
+ * if PSRAM is 20x slower than SRAM, the bus is the wall and Tier 1 has room; if
+ * it is 2x, there is far less on the table than that section claims.
+ *
+ * Small buffers deliberately -- they have to fit internal SRAM alongside the
+ * background RLE, and both arms use the same size so the comparison is honest.
+ *
+ * READ THE PSRAM ARM CAREFULLY. At 8 KB both buffers sit inside the 32 KB data
+ * cache, so the "psram" figures here are cache-resident throughput, NOT bus
+ * throughput -- measured 173.8 MB/s memset against benchPsram()'s 17.7 MB/s for
+ * the same operation at 392 KB. That 10x gap between the same memory hit two
+ * ways is the most useful number either benchmark produces:
+ *
+ *   - it settles the bus-bound question outright. Streaming PSRAM runs ~8.8 MB/s
+ *     against internal SRAM's ~308 MB/s, roughly 35x, so PERFORMANCE.md's
+ *     central claim is correct and was never actually measured before this.
+ *   - it says making a working set *fit* is worth as much as making the bus
+ *     faster, and costs no build-system migration. That is exactly what the
+ *     background RLE did: 400 KB of streaming PSRAM became 36 KB of SRAM.
+ *
+ * So do not read this as a PSRAM-vs-SRAM bus comparison; it is not one, and
+ * sizing the buffers up to make it one is impossible -- internal SRAM cannot
+ * hold a buffer big enough to defeat the cache.
+ */
+static void benchSram() {
+  constexpr size_t kBytes = 8u * 1024u;
+  constexpr int kReps = 256;  // small buffers, so repeat to get past timer noise
+  uint8_t *ps = static_cast<uint8_t *>(heap_caps_malloc(kBytes, MALLOC_CAP_SPIRAM));
+  uint8_t *pd = static_cast<uint8_t *>(heap_caps_malloc(kBytes, MALLOC_CAP_SPIRAM));
+  uint8_t *is = static_cast<uint8_t *>(
+      heap_caps_malloc(kBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  uint8_t *id = static_cast<uint8_t *>(
+      heap_caps_malloc(kBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  if (ps == nullptr || pd == nullptr || is == nullptr || id == nullptr) {
+    Log.printf("[bench2] alloc failed: %u B free internal, largest block %u B\n",
+               static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+               static_cast<unsigned>(
+                   heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+    heap_caps_free(ps); heap_caps_free(pd); heap_caps_free(is); heap_caps_free(id);
+    return;
+  }
+  const float mb = static_cast<float>(kBytes) * kReps / (1024.0f * 1024.0f);
+
+  auto timeSet = [&](uint8_t *p) {
+    const uint32_t t = micros();
+    for (int i = 0; i < kReps; ++i) memset(p, i, kBytes);
+    return micros() - t;
+  };
+  auto timeCpy = [&](uint8_t *d, uint8_t *s) {
+    const uint32_t t = micros();
+    for (int i = 0; i < kReps; ++i) memcpy(d, s, kBytes);
+    return micros() - t;
+  };
+
+  const uint32_t psSet = timeSet(ps);
+  const uint32_t isSet = timeSet(is);
+  const uint32_t ppCpy = timeCpy(pd, ps);   // PSRAM -> PSRAM
+  const uint32_t iiCpy = timeCpy(id, is);   // SRAM  -> SRAM
+  const uint32_t piCpy = timeCpy(id, ps);   // PSRAM -> SRAM, i.e. the RLE's old read
+
+  Log.printf("[bench2] %uKB x%d  memset: psram=%.1f sram=%.1f MB/s (%.1fx)  "
+             "memcpy: p->p=%.1f s->s=%.1f p->s=%.1f MB/s (s->s is %.1fx p->p)\n",
+             static_cast<unsigned>(kBytes / 1024), kReps,
+             mb * 1e6f / psSet, mb * 1e6f / isSet,
+             static_cast<double>(psSet) / isSet,
+             mb * 1e6f / ppCpy, mb * 1e6f / iiCpy, mb * 1e6f / piCpy,
+             static_cast<double>(ppCpy) / iiCpy);
+
+  heap_caps_free(ps); heap_caps_free(pd); heap_caps_free(is); heap_caps_free(id);
+}
 #endif
 
 static bool initLvgl() {
@@ -564,6 +642,7 @@ void setup() {
                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
 #if ATC_BENCH
   benchPsram();
+  benchSram();
 #endif
   Log.println("Ready.");
 }
