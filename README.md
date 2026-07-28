@@ -117,8 +117,18 @@ esp32-atchome/
 │   └── info_panel.cpp/.hpp
 ├── tests/host/              # workstation checks for the sweep geometry
 ├── Makefile
+├── PERFORMANCE.md           # standing review of where the frame budget goes
 └── README.md
 ```
+
+## Performance
+
+`src/frame_probe.hpp` records the measurement history — what each stage of the
+render path costs, and the two traps that show up as a collapsed `loop` rate
+rather than as a slow function. [PERFORMANCE.md](PERFORMANCE.md) is the
+forward-looking half: a ranked plan for what to do next, why the largest item
+is a build-time default rather than anything in `src/`, and which plausible
+optimisations were checked and ruled out.
 
 ## Tests
 
