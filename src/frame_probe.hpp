@@ -111,6 +111,34 @@
  * times a second where the aircraft alone painted ~6, so it is spending real
  * budget; if `loop` collapses, kSweepStepMs and kSweepTailDeg are the two
  * dials, and both are linear.
+ *
+ * ---------------------------------------------------------------------------
+ * A/B TRAP -- read before comparing two builds with these numbers. Every
+ * figure here scales with the number of aircraft in the air, and that is set
+ * by whatever adsb.fi returns at the time, not by anything in the build. Over
+ * a 100 s capture the count drifts far enough to swamp any effect below ~20%.
+ *
+ * Measured, 2026-07-28, the same two binaries (-Os vs -O2), back to back:
+ *
+ *   round 1   -Os 25.5 aircraft, -O2 21.0   =>  -O2 "wins" by 29% on fps
+ *   round 2   -Os 21.4 aircraft, -O2 26.4   =>  -O2 "loses" by 24% on fps
+ *   pooled    -Os 23.4 aircraft, -O2 23.8   =>  -1.8%, i.e. nothing
+ *
+ * Whichever build drew fewer aircraft won, by ~50 points of swing. A single
+ * run of this harness cannot resolve a sub-20% effect at all. Match the load
+ * or pool several rounds per arm, and report the aircraft count alongside any
+ * number you intend to act on -- kMaxRegions, kSweepBands and the sectorRowSpan
+ * hoist are all predicted to land in exactly the band this fabricates.
+ *
+ * What that experiment did establish, pooled over 88 samples per arm at
+ * matched load: -O2 (via compiler.optimization_flags, see the Makefile -- it
+ * does NOT work through extra_flags) moves `tasks`, the label anchor solver,
+ * by -17%, and moves fps, loop, lvgl, rast and vsync by less than 4%, which is
+ * noise. That is the whole thesis of PERFORMANCE.md in one measurement: an -O2
+ * across LVGL and all of src/ buys ~0% end to end because nothing on the
+ * render path is arithmetic-bound. Only the one genuinely compute-bound stage
+ * moved. Raise the bandwidth ceiling or touch fewer pixels; the compiler has
+ * nothing left to give here.
  * ---------------------------------------------------------------------------
  */
 

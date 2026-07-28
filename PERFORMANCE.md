@@ -1,7 +1,18 @@
 # Performance review
 
 A standing assessment of where this project's frame budget actually goes, and
-which levers are worth pulling. Reviewed 2026-07-28 against `cd5e5d5`.
+which levers are worth pulling. Written 2026-07-28 against `cd5e5d5`;
+**verified against the hardware and the toolchain the same day**, which
+corrected two of its claims and confirmed the rest.
+
+What changed on verification, for anyone who read the first version: PSRAM is
+already at 80 MHz, so Tier 1's headline 2x does not exist and the prize is
+roughly half what was advertised; the `-O2` recipe was backwards and would have
+been a no-op; `-O2` done correctly buys ~0% end to end, which is a
+*confirmation* of this document's thesis rather than a disappointment. The
+budget model also ignores the panel's bounce buffers. Each is marked in place
+below rather than quietly edited, on the same principle as the negative
+results.
 
 It is written as a ranked plan rather than a list of observations, because the
 ranking is the finding: the largest item by a wide margin is a build-time
@@ -37,57 +48,79 @@ arithmetic-bound. Nothing in the render path is. Every lever below therefore
 either raises the memory-system ceiling or stops consuming it; none of them
 make the code compute faster, because the code is not what is slow.
 
-## Tier 1 — the ceiling is probably a build default, not silicon
+> **This model understates scan-out, because it ignores the bounce buffers.**
+> `crowpanel_display.cpp` sets `bounce_buffer_size_px = kWidth * 20`. In that
+> mode IDF does not hand the framebuffer to the LCD DMA directly — it refills
+> an internal-SRAM bounce buffer from PSRAM with a CPU `memcpy` in the DMA EOF
+> ISR. So the 18.9 MB/s is a PSRAM read *plus* an SRAM write *plus* core-1 CPU
+> time in an interrupt, none of which appears in any probe slot. Two
+> consequences: the Tier 4 "the second core is idle" argument is weaker than it
+> looks, since core 1 is already absorbing this; and Tier 2's third framebuffer
+> may not be reachable at all, because `crowpanel_display.cpp:73-79` already
+> carries a fallback for bounce buffers being rejected alongside a *double*
+> framebuffer.
+>
+> It also cuts the other way, in Tier 1's favour. The bounce buffers exist
+> because direct PSRAM scan-out underran under contention. If the 64-byte cache
+> line lifts the ceiling, dropping them may become possible — an unclaimed
+> second dividend of the migration.
 
-The precompiled libraries `arduino-cli` hands us are built from
-[`esp32-arduino-lib-builder`](https://github.com/esp-arduino-libs/esp32-arduino-lib-builder).
-Its `configs/defconfig.esp32s3` is, in full, the following (plus ULP and MAC
-settings omitted here):
+## Tier 1 — half the ceiling is a build default; the other half was a wrong guess
+
+> **Checked 2026-07-28, and half of this section was wrong.** It originally
+> claimed PSRAM was running at 40 MHz, inferred from the setting being absent
+> from the lib-builder defconfig and falling through to the IDF Kconfig
+> default. The shipped `sdkconfig.h` was then read directly and says
+> `CONFIG_SPIRAM_SPEED_80M`. **We are already at 80 MHz. There is no 2x
+> there.** The cache-line half of the claim survived and is confirmed below.
+> The lesson is the obvious one: an absent defconfig entry does not mean the
+> Kconfig default applies, because lib-builder sets it elsewhere.
+
+What the precompiled libraries were actually built with — read from
+`esp32s3-libs/3.3.11/qio_opi/include/sdkconfig.h`, which is the variant our
+FQBN (`FlashMode=qio,PSRAM=opi`) selects, and identical in the other variants:
 
 ```
-CONFIG_BT_ENABLED=y
-CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
-CONFIG_SPIRAM=y
-CONFIG_LCD_RGB_RESTART_IN_VSYNC=y
+CONFIG_SPIRAM_MODE_OCT 1
+CONFIG_SPIRAM_SPEED_80M 1              <- already maxed; no lever here
+CONFIG_ESP32S3_DATA_CACHE_LINE_32B 1   <- the lever
+CONFIG_ESP32S3_DATA_CACHE_32KB 1       <- a second lever, of an available 64 KB
+CONFIG_COMPILER_OPTIMIZATION_SIZE 1
 ```
 
-and `configs/defconfig.common` carries `CONFIG_COMPILER_OPTIMIZATION_SIZE=y`.
+So one real finding remains, and it is specific to this board:
 
-**Neither `CONFIG_SPIRAM_SPEED_80M` nor `CONFIG_ESP32S3_DATA_CACHE_LINE_64B`
-appears anywhere.** Both fall through to the ESP-IDF defaults, which are
-40 MHz and a 32-byte line. That is two independent halvings, and the second one
-is specific to this board:
+**A 32-byte cache line on an octal bus.** The ESP32-S3 TRM specifies that Octal
+PSRAM in DDR mode transfers in 64-byte wrap bursts. With a 32-byte line, every
+line fill still costs a full 64-byte burst on the wire — we pay for 64 bytes and
+keep 32. Half the effective bandwidth, discarded at the bus. This matters here
+and not on a quad-PSRAM board, and the FQBN in the `Makefile` says `PSRAM=opi`.
 
-1. **PSRAM at 40 MHz rather than 80 MHz.** A straight 2x.
-2. **A 32-byte cache line on an octal bus.** The ESP32-S3 TRM specifies that
-   Octal PSRAM in DDR mode transfers in 64-byte wrap bursts. With a 32-byte
-   line, every line fill still costs a full 64-byte burst on the wire — we pay
-   for 64 bytes and keep 32. Half the effective bandwidth, discarded at the
-   bus. This matters here and not on a quad-PSRAM board, and the FQBN in the
-   `Makefile` says `PSRAM=opi`.
+Plus one the original review missed: the data cache is **32 KB of the S3's
+available 64 KB**, free in the same migration.
 
-The measured figures are consistent with this. 37.7 MB/s is about 24% of an
-80 MHz octal bus's theoretical 160 MB/s, which would be implausibly bad; it is
-about 47% of a 40 MHz bus, halved again by the line-size mismatch, which is
-roughly where a real PSRAM controller lands once per-burst latency is counted.
+The arithmetic re-derives cleanly, and in fact more cleanly than before. The
+original text argued that 37.7 MB/s being 24% of an 80 MHz bus's theoretical
+160 MB/s "would be implausibly bad, therefore it must be a 40 MHz bus." We are
+on the 80 MHz bus and we *are* at 24%. The 64-byte-burst-for-a-32-byte-line
+waste accounts for roughly half of that gap on its own — the same mechanism the
+section always described, now carrying the whole weight instead of half of it.
 
-> **Inferred, not measured.** The absent settings are confirmed — the defconfig
-> above was read directly. That IDF then defaults them to 40 MHz and 32 B is
-> from the Kconfig defaults, not from this board's boot log. Verify before
-> acting.
+**Revised prize: up to ~2x, not 2x-to-4x** — and it still costs a full
+build-system migration, which is why the plan at the end no longer opens with
+it.
 
 ### Verifying it
 
-Both checks are minutes, not hours:
-
 ```bash
-# The shipped sdkconfig.h is already on disk, next to the precompiled libs.
+# Windows / this machine. Note the per-chip layout: esp32s3-libs, not the
+# esp32-arduino-libs path older docs give, and %LOCALAPPDATA%\Arduino15 rather
+# than ~/.arduino15.
 grep -E "SPIRAM_SPEED|DATA_CACHE_LINE|DATA_CACHE_[0-9]+KB" \
-  ~/.arduino15/packages/esp32/tools/esp32-arduino-libs/*/esp32s3/**/sdkconfig.h
+  "$LOCALAPPDATA/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.11/qio_opi/include/sdkconfig.h"
 ```
 
-and the IDF boot log prints the PSRAM speed at INFO level on the 115200 serial
+The IDF boot log also prints the PSRAM speed at INFO level on the 115200 serial
 output — look for the `esp_psram: Found 8MB PSRAM device` block.
 
 ### Acting on it
@@ -109,23 +142,56 @@ them. Routes out, cheapest first:
 If the check above says 40 MHz or 32 B, **this is the 2x-to-4x and nothing
 else in this document comes close.** Everything below is scaled by its outcome.
 
-### `-Os`, separately
+### `-Os`, separately — done, and it buys ~0% end to end
 
 `CONFIG_COMPILER_OPTIMIZATION_SIZE=y` covers the IDF libraries, and
 `platform.txt`'s `compiler.{c,cpp}.flags` puts `-Os` on LVGL and all of `src/`
-too. `extra_flags` lands *after* the base flags in the compile recipe, and GCC
-takes the last `-O`, so this is a one-line change in the `Makefile`:
+too.
 
-```make
---build-property "compiler.cpp.extra_flags=-I$(SKETCH_DIR) -DLV_CONF_INCLUDE_SIMPLE -O2" \
---build-property "compiler.c.extra_flags=-O2"
+**The mechanism originally proposed here did not work.** It claimed
+`extra_flags` lands *after* the base flags so a trailing `-O2` would win. It
+lands *before*:
+
+```
+recipe.c.o.pattern="{compiler.c.cmd}" {compiler.c.extra_flags} {compiler.c.flags} ...
+compiler.c.flags=... {compiler.optimization_flags} ...
+compiler.optimization_flags=-Os
 ```
 
-The `c` variant is the one that matters most — LVGL is C. This will not touch
-the memcpy-bound stages; it is for the compute-bound ones: the label anchor
-solver at ~4.7 ms, `sectorRowSpan`, and LVGL's mask arithmetic. Typically
-20–40% on those. Flash is at 1 390 354 B of a 3 MB `huge_app`, so the size
-cost is free.
+Confirmed on a real compile line: the `extra_flags` payload sits at index 127
+and `-Os` at index 253. GCC takes the last `-O`, so `-O2` in `extra_flags` is
+silently discarded and produces a byte-identical binary — a false negative that
+would have read as "`-O2` doesn't help this codebase." The working lever is the
+property `-Os` itself comes from, which covers C, C++ and assembly at once:
+
+```make
+--build-property "compiler.optimization_flags=-O2"
+```
+
+This is now the `Makefile` default via `OPT_FLAGS ?= -O2`; build with
+`OPT_FLAGS=-Os` to revert. Flash goes 1 394 430 B → 1 505 498 B (+8.0%, still
+47% of a 3 MB `huge_app`), RAM is unchanged.
+
+**Measured, pooled over 88 samples per arm at matched aircraft load** (see the
+A/B TRAP note in `frame_probe.hpp` — the first attempt at this measurement was
+an artifact and reported a fictitious +29%):
+
+| stage | change |
+| --- | --- |
+| `tasks` — label anchor solver | **−17%** |
+| `fps`, `loop`, `lvgl`, `rast`, `vsync` | within ±4%, i.e. noise |
+
+The prediction in this section was right on both halves, including the half
+that says this changes nothing end to end. Keep it: the size is free, it
+compounds with anything that lifts the bandwidth ceiling, and it is the only
+Tier 1 item reachable without leaving `arduino-cli`. But **it is not a
+throughput win today and must not be counted as one.**
+
+It is also the strongest evidence in this document for the document's own
+thesis. If `-O2` across LVGL and all of `src/` moves end-to-end throughput by
+0%, there is essentially no arithmetic headroom anywhere on the render path —
+the same conclusion the SIMD negative result reached, now confirmed by a much
+blunter instrument.
 
 ## Tier 2 — stop spending the bus on things that are not the picture
 
@@ -285,6 +351,12 @@ then overwrites it. It does not: it runs `lv_area_diff()` against the current
 frame's invalid areas *before* copying, so only the ~8% residual that the new
 wedge does not cover is moved. Verified by reading `lv_refr.c` at v9.3.0.
 
+> **Re-verify before leaning on this.** The vendored LVGL is **9.5.0**, not the
+> 9.3.0 this was checked against (`C:\repos\arduino-libs\libraries\lvgl`). The
+> third-framebuffer item in Tier 2 was checked against the installed tree and
+> `lv_display_set_3rd_draw_buffer` is still present, but the `refr_sync_areas()`
+> / `lv_area_diff()` reasoning here has not been re-read at 9.5.0.
+
 **The sweep blend is not arithmetic-bound, so SIMD is not the answer today.**
 At 51 cycles per pixel for a bare PSRAM `memcpy` and ~67 for `blendSpan`
 including its geometry solve, the blend is running at or below copy speed. The
@@ -295,20 +367,34 @@ Raise the ceiling or touch fewer pixels.
 
 ## The plan, in order
 
-1. **Read `sdkconfig.h` and the boot log** for PSRAM speed and data-cache line
-   size. Everything else is scaled by the answer.
-2. **Add an internal-SRAM variant of every loop in `benchPsram()`** — same
+Reordered 2026-07-28. Steps 1 and 3 of the original are done; the migration
+moved down, because its prize halved once PSRAM turned out to be at 80 MHz
+already while its cost — a whole new build system — did not change.
+
+1. ~~Read `sdkconfig.h` and the boot log.~~ **Done.** 80 MHz, 32-byte line,
+   32 KB data cache. See Tier 1.
+2. ~~`-O2`.~~ **Done**, via `compiler.optimization_flags`. −17% on the solver,
+   ~0% end to end.
+3. **Before anything else is measured on hardware: match the load or pool the
+   rounds.** See the A/B TRAP note in `frame_probe.hpp`. Aircraft count swings
+   these numbers by ~50 points between runs, and every remaining item below is
+   predicted to land inside that band. This is now the gate on steps 5 and 6,
+   not a footnote.
+4. **Add an internal-SRAM variant of every loop in `benchPsram()`** — same
    shapes, SRAM buffers. That one comparison settles definitively whether each
    stage is bus-bound or compute-bound, and it is the measurement the probe
-   harness is currently missing; today that distinction is inferred.
-3. `-O2` via `extra_flags`. One line, reversible.
-4. Lower `pclk_hz` to 9–10 MHz and look at the screen.
-5. If (1) says 40 MHz or 32 B: **move the build to ESP-IDF with Arduino as a
-   component.** This is the 2x-to-4x.
-6. RLE the background; re-tune `kMaxRegions` and `kSweepBands`; hoist the
-   `sqrtf` and the reciprocals out of `sectorRowSpan()`.
-7. Third framebuffer.
-8. Then, and only then, split `compositeBackground()` across both cores and
+   harness is currently missing; today that distinction is inferred. Add a
+   bounce-buffers-off arm while you are in there, to size what they cost.
+5. Lower `pclk_hz` to 9–10 MHz and look at the screen.
+6. RLE the background — now the best code-level item in this document; re-tune
+   `kMaxRegions` and `kSweepBands`; hoist the `sqrtf` and the reciprocals out
+   of `sectorRowSpan()`.
+7. **Then** evaluate ESP-IDF with Arduino as a component, against a realistic
+   ~2x (64-byte cache line, 64 KB data cache, `-O2` on the IDF libraries too,
+   and possibly dropping the bounce buffers) rather than the 2x-to-4x this
+   document originally advertised.
+8. Third framebuffer — check it survives the bounce buffers first.
+9. Then, and only then, split `compositeBackground()` across both cores and
    look at SIMD.
 
 ## Sources
