@@ -33,7 +33,11 @@ static constexpr uint32_t kI2cHz = 300000;
 
 // Animation cadence. The panel refreshes at ~24 Hz and the flush waits on
 // VSYNC (tear-free), so this is an upper bound; idle frames are skipped.
-static constexpr unsigned long kRadarFrameMs = 50;
+//
+// 40 ms rather than 50 so that it divides RadarView::kSweepStepMs: the beam
+// steps on a whole number of these ticks, which is what stops it alternating
+// between a long and a short step and reading as a stutter.
+static constexpr unsigned long kRadarFrameMs = 40;
 
 static constexpr unsigned long kEnrichmentSuccessIntervalMs = 1200;
 static constexpr unsigned long kEnrichmentRetryIntervalMs = 5000;
@@ -625,13 +629,6 @@ void loop() {
     uiCount = 0;
   }
 
-  // The sweep runs on wall-clock time and drives its own invalidation, so it
-  // is deliberately outside the frame throttle *and* outside redraw()'s
-  // "nothing moved" skip -- it has to keep turning over an empty sky, and it
-  // must not force the rest of the view to repaint when it does. It touches no
-  // tracker state, so it needs no lock.
-  radarView.tickSweep(now);
-
   // Animate + redraw the radar (under the lock; only when something changed).
   if (now - lastFrameMs >= kRadarFrameMs) {
     const float dt = lastFrameMs == 0 ? 0.0f : (now - lastFrameMs) / 1000.0f;
@@ -644,28 +641,24 @@ void loop() {
     const Aircraft *sel = tracker.selected();
     uiHasSel = sel != nullptr;
 
-    bool moving = false;
-    for (size_t i = 0; i < n; ++i) {
-      if (arr[i].groundSpeedKts > 0.0f) {
-        moving = true;
-        break;
-      }
+    // New data grows the trails, which the per-frame dirty rects do not cover
+    // -- those track only the symbols and labels, all that moves between
+    // fetches. A full repaint here would be a ~200 ms hitch every 5 seconds,
+    // so only the trail extents are invalidated.
+    if (gDataDirty) {
+      radarView.markDataChanged();
     }
-    if (moving || gDataDirty || !everPainted) {
-      // New data grows the trails, which the per-frame dirty rects do not cover
-      // -- those track only the symbols and labels, all that moves between
-      // fetches. A full repaint here would be a ~200 ms hitch every 5 seconds,
-      // so only the trail extents are invalidated.
-      if (gDataDirty) {
-        radarView.markDataChanged();
-      }
-      if (!everPainted) {
-        radarView.markFullRepaint();
-      }
-      radarView.setSnapshot(arr, n, uiHasSel ? sel->hex : "");
-      radarView.redraw();
-      everPainted = true;
+    if (!everPainted) {
+      radarView.markFullRepaint();
     }
+    // Unconditionally: redraw() owns the decision now, and it has to, because
+    // the sweep beam advances on wall-clock time whether or not any aircraft
+    // moved. It still returns without painting when neither did -- which is
+    // also why the old "is anything moving?" scan is gone rather than merely
+    // ignored. It answered a coarser version of the same question.
+    radarView.setSnapshot(arr, n, uiHasSel ? sel->hex : "");
+    radarView.redraw();
+    everPainted = true;
     uiCount = n;
     if (uiHasSel) {
       selCopy = *sel;

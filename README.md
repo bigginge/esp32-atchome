@@ -19,6 +19,7 @@ Live ADS-B traffic on a square radar (left) with an aircraft detail panel (right
 ## Features
 
 - **Radar** (480×480): concentric range rings (labelled in nm) and N/E/S/W compass markers centred on your location; plane-shaped aircraft symbols oriented by track, coloured by altitude (green-cyan low → magenta high) with an altitude legend, per-aircraft callsign + flight-level labels, and trails (lower altitude = more distinct trails)
+- **Sweep beam**: a PPI beam rotates once every 6 s, with a phosphor tail behind it and a flare on each aircraft as it is crossed. It is composited by hand straight into the framebuffer — LVGL has no primitive for a wedge that would not cost a mask per pixel — and only the swept wedge is repainted, so it costs about a fifth of one core rather than a full-screen redraw per frame. The dials are at the top of `src/radar_view.hpp`, with the cost model that relates them; `kSweepEnabled = false` turns it off
 - **Info panel** (320×480): live clock, your location, aircraft-in-range count and data-freshness ("updated Ns ago"); for the selection: manufacturer, type, registration, flight number, distance (nm), altitude, ground speed, and origin/destination airports
 - **Responsive UI**: all network requests run on the ESP32-S3's second core, so the radar animates smoothly and touch stays responsive while data is fetched
 - **Touch select**: tap an aircraft to highlight it and load details; selection clears when it leaves range; defaults to the nearest aircraft
@@ -114,9 +115,28 @@ esp32-atchome/
 │   ├── tracker.cpp/.hpp
 │   ├── radar_view.cpp/.hpp
 │   └── info_panel.cpp/.hpp
+├── tests/host/              # workstation checks for the sweep geometry
 ├── Makefile
 └── README.md
 ```
+
+## Tests
+
+```bash
+make -C tests/host
+```
+
+Builds `src/radar_view.cpp` against real LVGL headers on the workstation (fetched
+on first run; `make -C tests/host LVGL_TAG=v9.3.0` to match a different install)
+and checks the sweep beam's geometry against a brute-force reference — that the
+sector solver returns exactly the pixels an atan2 would classify, that the bands
+handed to LVGL cover the whole swept wedge, and that the composite writes every
+pixel of the region it is given. That last one is the one that matters: with
+double-buffered DIRECT rendering, a pixel inside an invalid area that nobody
+writes keeps content from two frames ago, so it shows as a dot the beam left
+behind and never clears.
+
+Nothing here touches the firmware build; `make compile` never enters `tests/`.
 
 ## Serial
 

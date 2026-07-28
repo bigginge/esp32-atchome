@@ -9,18 +9,14 @@
  * changes every 2 s, invalidating a region of the info panel and perturbing the
  * very thing being measured.
  *
- * MEASUREMENT TRAP -- read before trusting any number here. This changed when
- * the radar stopped using an lv_canvas, so the history below spans both models:
- *
- *   Canvas era (the BASELINE block): lv_draw_*() only built a linked list of
- *   tasks and everything rasterised inside lv_canvas_finish_layer(), so a Scope
- *   around a draw stage measured task *creation* and all raster time landed
- *   together in kRaster. Splitting it needed an isolation build running
- *   init_layer / draw / finish_layer per stage (-DATC_ISOLATE_STAGES=1).
- *
- *   Now: drawing goes into the display's layer from LV_EVENT_DRAW_MAIN, and
- *   under LV_OS_NONE lv_draw_finalize_task_creation() dispatches inline. So a
- *   Scope around a draw call measures real rasterisation, not task creation.
+ * MEASUREMENT TRAP -- read before trusting any number here. With
+ * LV_USE_OS LV_OS_NONE the lv_draw_*() calls only build a linked list of draw
+ * tasks; the rasterisation all happens inside lv_canvas_finish_layer(). So a
+ * Scope around a draw stage measures task *creation* (essentially the PSRAM
+ * malloc cost), and every stage's raster time lands together in kRaster.
+ * Attributing raster time per stage needs a temporary isolation build that runs
+ * init_layer / draw / finish_layer once per stage -- compile with
+ * -DATC_ISOLATE_STAGES=1, see RadarView::redraw().
  *
  * ---------------------------------------------------------------------------
  * BASELINE, captured 2026-07-26 on the 480x480 canvas at 6-7 aircraft, before
@@ -73,30 +69,6 @@
  *   rast              ~15 ms per pass, ~4 passes per paint
  *   flash             1 390 354 B (was 1 512 342 with Montserrat)
  *
- * AFTER adding the PPI sweep (see RadarView::tickSweep):
- *
- *                     sweep off        sweep on (rung 0, 8 ticks/s)
- *   6-7 aircraft      150-250 loop/s   45-150 loop/s
- *   sweep raster      --               7-11 ms per tick
- *
- * CAUTION reading any earlier sweep figure: the first version never drew
- * anything. It computed each segment's bounding box but never assigned
- * dsc.start_angle / dsc.end_angle, and lv_draw_arc() returns immediately when
- * start == end, so the ~150 us it appeared to cost was the area arithmetic
- * alone. Every cost model built on that number was wrong by ~50x. A sweep tick
- * really costs ~35-40 ms: ~7-11 ms rasterising the wedge, ~8 ms restoring the
- * background over the band, and a ~20 ms VSYNC wait on a 24 Hz panel.
- *
- * The tick *rate* is therefore the only lever that matters, not the pixel
- * count -- and note the failure mode was silent: probe time was non-zero, the
- * angles logged looked right, and the sweep was simply absent from the screen.
- *
- * Note the 9-14 aircraft row: loop() already falls below 60/s there with the
- * sweep switched off, because the data repaints alone take ~900 ms of every
- * second (~6.5 paints/s at ~135 ms each, and the label solver alone is ~11 ms).
- * That is pre-existing and is the next thing worth attacking -- kMaxRegions and
- * the per-region background restore, not the sweep.
- *
  * Two traps found along the way, both worth remembering because neither shows
  * up as a slow function -- they show up as a collapsed `loop` rate:
  *   1. A transparent or rounded container breaks LVGL's cover check, so a
@@ -106,6 +78,39 @@
  *   2. LV_LABEL_LONG_SCROLL_CIRCULAR over LV_SIZE_CONTENT blocks re-runs the
  *      flex layout on every animation step. Eight of them cost ~80 ms per
  *      lv_timer_handler call and took `loop` from ~200/s to ~12/s.
+ *
+ * ---------------------------------------------------------------------------
+ * THE SWEEP BEAM changes what these numbers mean, because it is the first
+ * thing here that has to paint on a clock rather than on a change. Four cuts
+ * were made to pay for it, all of them things that were being redrawn for no
+ * reason rather than things that were slow:
+ *
+ *   - The legend was repainting in full on every pass -- a translucent rounded
+ *     backdrop over ~8 800 px, which is a masked read-modify-write and the
+ *     most expensive shape in the view, plus 40 gradient segments and six
+ *     labels -- almost always for a region nowhere near it. Now culled.
+ *   - Symbols were culled against a box stretched to include their trail, so a
+ *     region touching one end of a long trail built six line tasks for a glyph
+ *     at the other end. Now culled against the glyph's own box.
+ *   - Trails were culled per trail rather than per segment, with the same
+ *     effect one level down.
+ *   - Round line caps are LVGL radius-masked fills: a PSRAM allocation and a
+ *     circle mask each, twelve per aircraft per pass. The casing pass's six
+ *     are covered by the fill pass anyway, and are gone.
+ *
+ * `clear` is retired: the background restore is now a direct row memcpy out of
+ * the cache, inside the draw handler, and so lands in `rast` with everything
+ * else. `sweep` is live for the first time and measures only the beam's own
+ * blend, nested inside `rast` -- so it is a component of that number, not an
+ * addition to it. The blend is a read-blend-write between two PSRAM buffers,
+ * which is to say it is bandwidth, not arithmetic: judge it against the ~4.7
+ * Mpx/s that the memcpy figure above implies, and expect roughly 25 kpx per
+ * step at the defaults in radar_view.hpp.
+ *
+ * `loop` is still the number to judge the system by. The beam paints ~12.5
+ * times a second where the aircraft alone painted ~6, so it is spending real
+ * budget; if `loop` collapses, kSweepStepMs and kSweepTailDeg are the two
+ * dials, and both are linear.
  * ---------------------------------------------------------------------------
  */
 
@@ -116,11 +121,11 @@
 namespace probe {
 
 enum Slot : uint8_t {
-  kClear = 0,  // canvas-era clear (fill_bg); unused since the direct-draw switch
-  kSweep,      // drawSweep -- real raster time, dispatched inline
-  kTasks,      // the label anchor solver, on painting frames only
-  kRaster,     // paintDirect -- one sample per invalidated region
-  kLvgl,       // lv_timer_handler; its .n is the loop() iteration count
+  kClear = 0,  // unused since the background restore became a direct memcpy
+  kSweep,      // the beam's blend, nested inside kRaster
+  kTasks,      // label anchor solver + trail/symbol/label task creation
+  kRaster,     // the draw handler -- where the drawing actually happens
+  kLvgl,       // lv_timer_handler: layout, widget redraw, canvas blit
   kPresent,    // esp_lcd_panel_draw_bitmap (cache write-back + arm the flip)
   kVsync,      // waitVsync -- idle time, NOT cost; kept separate so it does not
                // inflate the apparent frame cost

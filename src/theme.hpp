@@ -50,10 +50,14 @@ constexpr uint32_t kHomeCaption = 0x9AAAB8;
 constexpr uint32_t kRadarLabel = 0xD8E2EC;  // unselected aircraft label text
 constexpr uint32_t kLegendTick = 0x9AAAB8;
 constexpr uint32_t kGround = 0x8A9AAA;  // altitude <= 0 / unknown
-// PPI sweep. A phosphor green-cyan, deliberately off the altitude ramp (which
-// runs green-cyan -> magenta at high saturation) so it reads as illumination
-// rather than as another aircraft. Always drawn at low opacity.
-constexpr uint32_t kSweep = 0x39D3A0;
+
+// ---- Sweep beam ------------------------------------------------------------
+// Phosphor green, deliberately off the altitude ramp's axis: that ramp runs
+// green-cyan -> magenta, so a beam anywhere near cyan would read as "a very low
+// aircraft smeared across the screen". The beam is also composited *under* the
+// symbols, which is the other half of keeping the two languages apart.
+constexpr uint32_t kSweepBeam = 0x2FE3A6;  // the decaying wedge
+constexpr uint32_t kSweepEdge = 0xC8FFE8;  // the hot leading edge, and blip flare
 
 // ---- Spacing scale (4 px base) ---------------------------------------------
 constexpr int32_t kSp1 = 4;
