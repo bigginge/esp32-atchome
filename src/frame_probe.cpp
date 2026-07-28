@@ -39,10 +39,15 @@ void report(unsigned long nowMs) {
   // saturated by painting.
   Log.printf("[frame] radar=%lu loop=%lu", static_cast<unsigned long>(gFrames),
              static_cast<unsigned long>(g[kLvgl].n));
+  // avg/max xN. N is printed because without it these averages cannot be
+  // reconciled against the window: a stage that runs several times per
+  // lv_timer_handler call (rast, once per draw pass) contributes avg*N, not
+  // avg, and the difference is where unattributed time hides.
   for (int i = 0; i < kSlotCount; ++i) {
     const uint32_t avg = g[i].n ? g[i].sum / g[i].n : 0;
-    Log.printf(" %s=%lu/%lu", kName[i], static_cast<unsigned long>(avg),
-                  static_cast<unsigned long>(g[i].max));
+    Log.printf(" %s=%lu/%lu x%lu", kName[i], static_cast<unsigned long>(avg),
+                  static_cast<unsigned long>(g[i].max),
+                  static_cast<unsigned long>(g[i].n));
     g[i] = {0, 0, 0};
   }
   const float fps = elapsed ? (1000.0f * static_cast<float>(gFrames) /
