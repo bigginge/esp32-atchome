@@ -35,10 +35,14 @@
 #ifndef REFRESH_INTERVAL_MS
 #define REFRESH_INTERVAL_MS 5000
 #endif
+#ifndef WIFI_COUNTRY
+#define WIFI_COUNTRY "GB"
+#endif
 
 namespace settings {
 
 const unsigned long kRefreshIntervalMs = REFRESH_INTERVAL_MS;
+const char *const kWifiCountry = WIFI_COUNTRY;
 
 namespace {
 

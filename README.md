@@ -78,6 +78,12 @@ wizard is skipped entirely.
 
 - WPA/TKIP-only access points are refused: the ESP32 core's default minimum security is
   `WIFI_AUTH_WPA2_PSK`. Open networks and WPA2/WPA3 work.
+- The scan covers the channels legal in `WIFI_COUNTRY` (default `"GB"`, channels 1–13).
+  This is set explicitly because the ESP32 otherwise starts in world-safe mode and scans
+  only 1–11 until it associates, at which point it adopts the AP's advertised country —
+  so without it, neighbours on channel 12 or 13 are missing from the list precisely when
+  you are trying to pick one. `WIFI_COUNTRY` is a compile-time `config.h` value and, unlike
+  the rest of that file, is not an NVS seed: it applies on every build.
 - The IP-geolocation lookup ([ip-api.com](https://ip-api.com/)) is plain HTTP — its free
   tier has no TLS endpoint. It is only ever a suggestion you confirm on screen, and the
   coordinates are range-checked before being offered. Everything else the device fetches

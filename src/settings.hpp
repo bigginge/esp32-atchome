@@ -24,6 +24,12 @@ namespace settings {
  *  compile-time (seeded from config.h like the rest). */
 extern const unsigned long kRefreshIntervalMs;
 
+/** Regulatory domain, as an ISO country code. Decides which channels a scan
+ *  visits, so it has to be set before the wizard's first scan — which rules out
+ *  NVS, since a fresh device reaches the wizard with nothing stored. Unlike the
+ *  rest of config.h this is a plain compile-time constant, not a seed. */
+extern const char *const kWifiCountry;
+
 /** Reads NVS into the cached copy, seeding from config.h on first boot.
  *  Call once from setup(), before anything reads the radius. */
 void load();

@@ -6,6 +6,7 @@
 #include <PCA9557.h>
 #include <time.h>
 #include <esp_heap_caps.h>
+#include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -115,6 +116,21 @@ static void resetTouchViaPca9557() {
   ioExpander.pinMode(1, INPUT);
 }
 
+// The active regulatory domain, e.g. "GB ch 1-13". Worth printing rather than
+// assuming: the policy is AUTO, so an associated station reports the AP's
+// country, not necessarily the one we asked for. Read-only, so either core may
+// call it.
+static const char *describeCountry(char *buf, size_t size) {
+  wifi_country_t c;
+  if (esp_wifi_get_country(&c) != ESP_OK) {
+    snprintf(buf, size, "country unknown");
+  } else {
+    snprintf(buf, size, "%.2s ch %u-%u", c.cc, static_cast<unsigned>(c.schan),
+             static_cast<unsigned>(c.schan + c.nchan - 1));
+  }
+  return buf;
+}
+
 // ===== Setup-mode worker (core 0) =====
 // These run only while networkTask is parked, so they can take over the WiFi
 // stack without racing an in-flight fetch.
@@ -129,45 +145,74 @@ static int runScan() {
                                       /*passive=*/false, /*max_ms_per_chan=*/120);
   ScanEntry *out = netctl::scanBuffer();
   size_t k = 0;
-  for (int16_t i = 0; i < n && k < kMaxScanEntries; ++i) {
+
+  // out[0..k) is kept sorted strongest-first as we go rather than sorted at the
+  // end, so that when more than kMaxScanEntries unique SSIDs are in range we can
+  // evict the weakest instead of keeping whichever ones the driver happened to
+  // report first.
+  for (int16_t i = 0; i < n; ++i) {
     const String ssid = WiFi.SSID(i);
     if (ssid.isEmpty()) {
       continue;  // hidden AP; reachable via "Other network..."
     }
-    bool duplicate = false;
+    const int32_t raw = WiFi.RSSI(i);
+    const int8_t rssi = static_cast<int8_t>(raw < -127 ? -127 : (raw > 0 ? 0 : raw));
+    // Per-BSS, before dedup and before the cap: the channel column is how you
+    // tell whether the regulatory domain is letting the sweep reach 12/13.
+    Log.printf("[setup]   ch %2d  %4d dBm  %s\n", static_cast<int>(WiFi.channel(i)),
+                  static_cast<int>(rssi), ssid.c_str());
+
+    size_t dup = k;
     for (size_t j = 0; j < k; ++j) {
       if (strcmp(out[j].ssid, ssid.c_str()) == 0) {
-        duplicate = true;  // same network on 2.4 and 5 GHz, or a mesh node
+        dup = j;  // same network on 2.4 and 5 GHz, or a mesh node
         break;
       }
     }
-    if (duplicate) {
-      continue;
-    }
-    strncpy(out[k].ssid, ssid.c_str(), sizeof(out[k].ssid) - 1);
-    out[k].ssid[sizeof(out[k].ssid) - 1] = '\0';
-    const int32_t rssi = WiFi.RSSI(i);
-    out[k].rssi = static_cast<int8_t>(rssi < -127 ? -127 : (rssi > 0 ? 0 : rssi));
-    out[k].secure = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
-    ++k;
-  }
-  // The driver calloc's its record array from internal heap; release it now
-  // rather than holding it for however long the wizard stays open.
-  WiFi.scanDelete();
 
-  // Strongest first (insertion sort; k <= 24).
-  for (size_t a = 1; a < k; ++a) {
-    const ScanEntry tmp = out[a];
-    size_t b = a;
+    size_t slot;
+    if (dup < k) {
+      // One row per SSID, and the strongest sighting sets what we show -- both
+      // fields together, so the row describes one BSS rather than mixing the
+      // signal of one band with the security of another.
+      if (rssi <= out[dup].rssi) {
+        continue;
+      }
+      out[dup].rssi = rssi;
+      out[dup].secure = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+      slot = dup;
+    } else {
+      if (k < kMaxScanEntries) {
+        slot = k++;
+      } else if (rssi > out[k - 1].rssi) {
+        slot = k - 1;  // full, and this beats the weakest we kept
+      } else {
+        continue;
+      }
+      strncpy(out[slot].ssid, ssid.c_str(), sizeof(out[slot].ssid) - 1);
+      out[slot].ssid[sizeof(out[slot].ssid) - 1] = '\0';
+      out[slot].rssi = rssi;
+      out[slot].secure = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+    }
+
+    // Shift the touched entry forward until the order holds again.
+    const ScanEntry tmp = out[slot];
+    size_t b = slot;
     while (b > 0 && out[b - 1].rssi < tmp.rssi) {
       out[b] = out[b - 1];
       --b;
     }
     out[b] = tmp;
   }
+  // The driver calloc's its record array from internal heap; release it now
+  // rather than holding it for however long the wizard stays open.
+  WiFi.scanDelete();
 
   netctl::setScanCount(k);
-  Log.printf("[setup] scan: %u networks\n", static_cast<unsigned>(k));
+
+  char domain[24];
+  Log.printf("[setup] scan: %u networks (%s)\n", static_cast<unsigned>(k),
+                describeCountry(domain, sizeof(domain)));
   return static_cast<int>(k);
 }
 
@@ -672,6 +717,23 @@ void setup() {
   // reconnect loop issues every 15 s while the AP is down.
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
+
+  // The driver defaults to "01" (world safe mode, channels 1-11) and only widens
+  // to the AP's advertised country once associated -- so an unassociated scan
+  // silently misses channels 12/13, and the wizard's network list is short in
+  // exactly the case where it matters. ieee80211d stays enabled, so this only
+  // sets the *unassociated* baseline; a connected station still follows the AP.
+  // Must come after mode() (which runs esp_wifi_init) and after persistent(false)
+  // (which selects WIFI_STORAGE_RAM, so this doesn't write flash every boot).
+  const esp_err_t countryErr = esp_wifi_set_country_code(settings::kWifiCountry, true);
+  if (countryErr != ESP_OK) {
+    Log.printf("[wifi] country %s rejected: %s\n", settings::kWifiCountry,
+                  esp_err_to_name(countryErr));
+  }
+  {
+    char domain[24];
+    Log.printf("[wifi] %s\n", describeCountry(domain, sizeof(domain)));
+  }
 
   // Networking on core 0 (WiFi's core); the Arduino loop (UI + LVGL) owns core 1.
   // Started before the wizard so the wizard can use it as its scan / connect /
