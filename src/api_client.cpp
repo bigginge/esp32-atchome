@@ -7,9 +7,129 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <esp_heap_caps.h>
 #include <string.h>
 
 static constexpr uint16_t kHttpTimeoutMs = 4000;
+
+// adsb.fi runs ~26 KB at 32 aircraft and grows with traffic; this only has to
+// stop a runaway response from eating PSRAM.
+static constexpr size_t kMaxBodyBytes = 96 * 1024;
+
+namespace {
+
+struct PsramBuffer {
+  char *ptr = nullptr;
+  ~PsramBuffer() {
+    if (ptr != nullptr) {
+      heap_caps_free(ptr);
+    }
+  }
+};
+
+}  // namespace
+
+/** Reads `expected` body bytes into PSRAM. Returns the count actually read.
+ *
+ *  Why not just hand the socket to deserializeJson(): ArduinoJson reads via
+ *  Stream::readBytes, which is virtual, so the call lands on
+ *  NetworkClient::readBytes -- and that breaks out the moment read() returns a
+ *  negative, calling it an error. But NetworkClientSecure::read() returns -1
+ *  whenever available() == 0, which mid-body simply means the next TLS record
+ *  has not arrived yet. The resulting short read reaches the parser as
+ *  end-of-input, so a perfectly healthy response fails as IncompleteInput at a
+ *  random point, more often the more records the body spans.
+ *
+ *  The buffer is NUL-terminated, and the caller must keep it alive for as long
+ *  as the parsed document is in use: deserializeJson() parses it in place and
+ *  the document's strings point into it. */
+static size_t readBodyToPsram(WiFiClientSecure &client, size_t expected,
+                              unsigned long timeoutMs, PsramBuffer *out) {
+  out->ptr = static_cast<char *>(heap_caps_malloc(expected + 1, MALLOC_CAP_SPIRAM));
+  if (out->ptr == nullptr) {
+    return 0;
+  }
+
+  size_t got = 0;
+  const unsigned long deadline = millis() + timeoutMs;
+  while (got < expected) {
+    const int r = client.read(reinterpret_cast<uint8_t *>(out->ptr) + got, expected - got);
+    if (r > 0) {
+      got += static_cast<size_t>(r);
+      continue;
+    }
+    // r <= 0 is "nothing decrypted yet", not a failure. Only the deadline or a
+    // socket that is closed *and* drained ends the read.
+    if (static_cast<long>(millis() - deadline) >= 0) {
+      break;
+    }
+    if (!client.connected() && client.available() <= 0) {
+      break;
+    }
+    delay(2);
+  }
+
+  out->ptr[got] = '\0';
+  return got;
+}
+
+/** GETs `url` and parses the JSON body into `doc`. `filter` may be null.
+ *
+ *  `body` must outlive every use of `doc`: the parse is in place, so the
+ *  document's strings point into the buffer rather than being copied onto the
+ *  internal heap. `tag` prefixes the log lines, e.g. "[hexdb] Route". */
+static bool fetchJson(const char *url, const char *tag, JsonDocument &doc, PsramBuffer *body,
+                      JsonDocument *filter) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+
+  if (!http.begin(client, url)) {
+    Log.printf("%s begin failed\n", tag);
+    return false;
+  }
+
+  // Without this a gzipped body would reach the parser still compressed.
+  http.addHeader("Accept-Encoding", "identity");
+  http.setTimeout(kHttpTimeoutMs);
+
+  const int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    Log.printf("%s HTTP %d\n", tag, httpCode);
+    http.end();
+    return false;
+  }
+
+  const int contentLen = http.getSize();
+  if (contentLen <= 0 || static_cast<size_t>(contentLen) > kMaxBodyBytes) {
+    // A chunked response would need HTTPClient to de-frame it, but getStream()
+    // hands back the raw socket, so the chunk headers would land in the JSON.
+    // Fail loudly rather than parse garbage.
+    Log.printf("%s unusable Content-Length %d\n", tag, contentLen);
+    http.end();
+    return false;
+  }
+
+  const size_t expected = static_cast<size_t>(contentLen);
+  const size_t got = readBodyToPsram(client, expected, kHttpTimeoutMs, body);
+  http.end();
+
+  if (got != expected) {
+    Log.printf("%s short body %u/%u B\n", tag, static_cast<unsigned>(got),
+               static_cast<unsigned>(expected));
+    return false;
+  }
+
+  const DeserializationError err =
+      filter != nullptr
+          ? deserializeJson(doc, body->ptr, got, DeserializationOption::Filter(*filter))
+          : deserializeJson(doc, body->ptr, got);
+  if (err) {
+    Log.printf("%s JSON %s (%u B)\n", tag, err.c_str(), static_cast<unsigned>(got));
+    return false;
+  }
+  return true;
+}
 
 static void safeJsonCopy(char *dest, size_t destSize, JsonObject obj, const char *key) {
   dest[0] = '\0';
@@ -40,30 +160,12 @@ bool fetchNearbyAircraft(float homeLat, float homeLon, int radiusNm,
     return false;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-
   char url[160];
   snprintf(url, sizeof(url),
            "https://opendata.adsb.fi/api/v3/lat/%.4f/lon/%.4f/dist/%d",
            homeLat, homeLon, radiusNm);
 
   Log.printf("[adsb.fi] GET %s\n", url);
-
-  if (!http.begin(client, url)) {
-    Log.println("[adsb.fi] begin failed");
-    return false;
-  }
-
-  http.addHeader("Accept-Encoding", "identity");
-  http.setTimeout(kHttpTimeoutMs);
-  const int httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) {
-    Log.printf("[adsb.fi] HTTP %d\n", httpCode);
-    http.end();
-    return false;
-  }
 
   JsonDocument filter;
   filter["ac"][0]["hex"] = true;
@@ -76,13 +178,9 @@ bool fetchNearbyAircraft(float homeLat, float homeLon, int radiusNm,
   filter["ac"][0]["gs"] = true;
   filter["ac"][0]["track"] = true;
 
+  PsramBuffer body;
   JsonDocument doc;
-  DeserializationError err =
-      deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
-  http.end();
-
-  if (err) {
-    Log.printf("[adsb.fi] JSON %s\n", err.c_str());
+  if (!fetchJson(url, "[adsb.fi]", doc, &body, &filter)) {
     return false;
   }
 
@@ -180,31 +278,13 @@ bool fetchAircraftDetails(Aircraft &aircraft) {
     return false;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-
   char url[80];
   snprintf(url, sizeof(url), "https://hexdb.io/api/v1/aircraft/%s", aircraft.hex);
   Log.printf("[hexdb] Aircraft %s\n", url);
 
-  if (!http.begin(client, url)) {
-    return false;
-  }
-
-  http.setTimeout(kHttpTimeoutMs);
-  const int httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) {
-    Log.printf("[hexdb] Aircraft HTTP %d\n", httpCode);
-    http.end();
-    return false;
-  }
-
+  PsramBuffer body;
   JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, http.getStream());
-  http.end();
-  if (err) {
-    Log.printf("[hexdb] Aircraft JSON %s\n", err.c_str());
+  if (!fetchJson(url, "[hexdb] Aircraft", doc, &body, nullptr)) {
     return false;
   }
 
@@ -229,27 +309,12 @@ static bool fetchAirportInfo(const char *icao, char *buffer, size_t bufferSize) 
   strncpy(buffer, icao, bufferSize - 1);
   buffer[bufferSize - 1] = '\0';
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-
   char url[96];
   snprintf(url, sizeof(url), "https://hexdb.io/api/v1/airport/icao/%s", icao);
-  if (!http.begin(client, url)) {
-    return false;
-  }
 
-  http.setTimeout(kHttpTimeoutMs);
-  const int httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) {
-    http.end();
-    return false;
-  }
-
+  PsramBuffer body;
   JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, http.getStream());
-  http.end();
-  if (err) {
+  if (!fetchJson(url, "[hexdb] Airport", doc, &body, nullptr)) {
     return false;
   }
 
@@ -268,29 +333,16 @@ bool fetchRouteInfo(Aircraft &aircraft) {
   }
 
   if (aircraft.routeLookupStep == 0) {
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-
     char url[96];
     snprintf(url, sizeof(url), "https://hexdb.io/api/v1/route/icao/%s", aircraft.callsign);
     Log.printf("[hexdb] Route %s\n", url);
 
-    if (!http.begin(client, url)) {
-      return false;
-    }
-    http.setTimeout(kHttpTimeoutMs);
-    const int httpCode = http.GET();
-    if (httpCode != HTTP_CODE_OK) {
-      Log.printf("[hexdb] Route HTTP %d\n", httpCode);
-      http.end();
-      return false;
-    }
-
+    PsramBuffer body;
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, http.getStream());
-    http.end();
-    if (err || !doc["route"].is<const char *>()) {
+    if (!fetchJson(url, "[hexdb] Route", doc, &body, nullptr)) {
+      return false;
+    }
+    if (!doc["route"].is<const char *>()) {
       return false;
     }
 
