@@ -6,10 +6,16 @@
 #include <stdio.h>
 #include <string.h>
 
-// The panel is a fixed width with no scrolling, so every block must have a
-// deterministic height: values are single-line and ellipsized rather than
-// wrapping, otherwise a long airport name pushes the route off the bottom.
-static constexpr int32_t kBlockPadBottom = theme::kSp2;
+// The panel is a fixed height with no scrolling, so every block must have a
+// bounded height: values ellipsize once they hit their line budget rather than
+// wrapping without limit, otherwise a long airport name pushes the route off
+// the bottom. See makeValue() for how that bound is enforced.
+//
+// Blocks are separated by the parent's pad_row alone. They used to also carry a
+// pad_bottom of their own, which stacked with the gap -- and the gap itself was
+// an 11 px default inherited from lv_theme_default, because neither flex column
+// below set one. Roughly 19 px between every block, none of it chosen here.
+static constexpr int32_t kBlockGap = theme::kSp3;
 
 /** Transparent grouping container: the shared half of every block below. */
 static lv_obj_t *makeContainer(lv_obj_t *parent) {
@@ -23,7 +29,6 @@ static lv_obj_t *makeBlock(lv_obj_t *parent) {
   lv_obj_t *block = makeContainer(parent);
   lv_obj_set_width(block, LV_PCT(100));
   lv_obj_set_height(block, LV_SIZE_CONTENT);
-  lv_obj_set_style_pad_bottom(block, kBlockPadBottom, 0);
   lv_obj_set_flex_flow(block, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(block, 2, 0);
   return block;
@@ -37,7 +42,22 @@ static lv_obj_t *makeCaption(lv_obj_t *parent, const char *caption) {
 }
 
 /**
- * A readout. Overflow ellipsizes rather than scrolling.
+ * A readout, bounded to `lines` lines: it wraps up to that many, then
+ * ellipsizes.
+ *
+ * The max_height is what makes LV_LABEL_LONG_DOT work at all. LVGL only
+ * inserts the dots when the text overflows a *constrained* height
+ * (lv_label.c: `size.y > lv_area_get_height(&txt_coords)`), and the label
+ * default height is LV_SIZE_CONTENT, which just grows to whatever the text
+ * needs -- so the condition never fires and the text silently wraps instead.
+ * Capping the height via max_height is what the dots branch tests against
+ * (lv_label.c applies it to the label's reported self-size). Without it the
+ * long-mode setting below is decorative, and a long airport name pushes the
+ * route off the bottom of the panel.
+ *
+ * This caps rather than fixes the height, so a one-line value still occupies
+ * one line and its block shrinks to match; `lines` is a worst case, not a
+ * reservation.
  *
  * These were circular-scroll marquees. Measured, that was very expensive: the
  * animation steps continuously, and because the panel is built from
@@ -46,25 +66,28 @@ static lv_obj_t *makeCaption(lv_obj_t *parent, const char *caption) {
  * cost ~80 ms per call even on iterations where the radar did not paint, and
  * the main loop fell from ~60 to ~12 iterations a second. The animation was
  * starving itself -- which is exactly what the visible jitter was.
- *
- * If scrolling names are wanted back, the blocks need fixed heights first (see
- * the deterministic-height note at the top of this file); LV_SIZE_CONTENT is
- * what makes each step cost a layout pass.
  */
-static lv_obj_t *makeValue(lv_obj_t *parent, const lv_font_t *font) {
+static lv_obj_t *makeValue(lv_obj_t *parent, const lv_font_t *font, int32_t lines = 1) {
   lv_obj_t *valueLabel = lv_label_create(parent);
   lv_label_set_text(valueLabel, "—");
   lv_label_set_long_mode(valueLabel, LV_LABEL_LONG_DOT);
   lv_obj_set_width(valueLabel, LV_PCT(100));
   lv_obj_add_style(valueLabel, &theme::styleValue, 0);
   lv_obj_set_style_text_font(valueLabel, font, 0);
+  // text_line_space is 0 everywhere in this app, so N lines is exactly N line
+  // heights. Revisit this if that ever stops being true.
+  lv_obj_set_style_max_height(valueLabel, lines * lv_font_get_line_height(font), 0);
   return valueLabel;
 }
 
-static lv_obj_t *addField(lv_obj_t *parent, const char *caption, lv_obj_t **valueOut) {
+/** The font must be passed in rather than restyled afterwards: makeValue sizes
+ *  the label's line budget from it, so a later font swap would leave the two
+ *  disagreeing and clip the value. */
+static lv_obj_t *addField(lv_obj_t *parent, const char *caption, lv_obj_t **valueOut,
+                          const lv_font_t *font) {
   lv_obj_t *block = makeBlock(parent);
   makeCaption(block, caption);
-  *valueOut = makeValue(block, theme::fontBody());
+  *valueOut = makeValue(block, font);
   return block;
 }
 
@@ -73,7 +96,6 @@ static lv_obj_t *addMetricRow(lv_obj_t *parent) {
   lv_obj_t *row = makeContainer(parent);
   lv_obj_set_width(row, LV_PCT(100));
   lv_obj_set_height(row, LV_SIZE_CONTENT);
-  lv_obj_set_style_pad_bottom(row, kBlockPadBottom, 0);
   lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
   lv_obj_set_style_pad_column(row, theme::kSp2, 0);
   return row;
@@ -126,20 +148,42 @@ void InfoPanel::create(lv_obj_t *parent) {
   lv_obj_set_style_text_color(timeLabel_, theme::c(theme::kText), 0);
   lv_obj_set_style_text_font(timeLabel_, theme::fontClock(), 0);
 
-  dateLabel_ = lv_label_create(clockContainer_);
+  // The date shares its row with the stats readout. The stats used to be the
+  // panel's last child, which cost a line plus a column gap -- 30 px that the
+  // route block needs far more than the clock card needs the whitespace. The
+  // date is ~90 px of a 270 px row and the settings gear floats over the *time*
+  // row above, so the right-hand side here is free.
+  lv_obj_t *dateRow = makeContainer(clockContainer_);
+  lv_obj_set_width(dateRow, LV_PCT(100));
+  lv_obj_set_height(dateRow, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(dateRow, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(dateRow, theme::kSp2, 0);
+
+  dateLabel_ = lv_label_create(dateRow);
   lv_label_set_text(dateLabel_, "------------");
   lv_obj_add_style(dateLabel_, &theme::styleCaption, 0);
   lv_obj_set_style_text_letter_space(dateLabel_, 0, 0);
 
-  // Second card: whichever of the status line or the detail fields is showing.
-  // It takes the remaining height so the stats footer stays pinned at the
-  // bottom of the panel.
+  statsLabel_ = lv_label_create(dateRow);
+  lv_label_set_text(statsLabel_, "");
+  lv_label_set_long_mode(statsLabel_, LV_LABEL_LONG_DOT);
+  lv_obj_set_flex_grow(statsLabel_, 1);
+  lv_obj_set_style_max_height(statsLabel_, lv_font_get_line_height(theme::fontCaption()), 0);
+  lv_obj_set_style_text_align(statsLabel_, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_obj_set_style_text_color(statsLabel_, theme::c(theme::kTextMuted), 0);
+  lv_obj_set_style_text_font(statsLabel_, theme::fontCaption(), 0);
+
+  // Second card, and the panel's last child: whichever of the status line or the
+  // detail fields is showing. It grows into all the height the clock leaves.
   lv_obj_t *bodyCard = lv_obj_create(panel_);
   lv_obj_add_style(bodyCard, &theme::styleCard, 0);
   lv_obj_clear_flag(bodyCard, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_width(bodyCard, LV_PCT(100));
   lv_obj_set_flex_grow(bodyCard, 1);
   lv_obj_set_flex_flow(bodyCard, LV_FLEX_FLOW_COLUMN);
+  // Explicit, because lv_theme_default's card style otherwise supplies an
+  // 11 px pad_row here that nothing in this file asked for.
+  lv_obj_set_style_pad_row(bodyCard, kBlockGap, 0);
 
   statusLabel_ = lv_label_create(bodyCard);
   lv_label_set_text(statusLabel_, "Connecting...");
@@ -152,10 +196,13 @@ void InfoPanel::create(lv_obj_t *parent) {
   lv_obj_set_width(fieldsCont_, LV_PCT(100));
   lv_obj_set_flex_grow(fieldsCont_, 1);
   lv_obj_set_flex_flow(fieldsCont_, LV_FLEX_FLOW_COLUMN);
+  // The only separation between blocks; see kBlockGap.
+  lv_obj_set_style_pad_row(fieldsCont_, kBlockGap, 0);
   lv_obj_add_flag(fieldsCont_, LV_OBJ_FLAG_HIDDEN);
 
-  addField(fieldsCont_, "AIRCRAFT", &aircraft_);
-  addField(fieldsCont_, "FLIGHT", &flight_);
+  // The aircraft line is promoted to the title font for a clearer hierarchy.
+  addField(fieldsCont_, "AIRCRAFT", &aircraft_, theme::fontTitle());
+  addField(fieldsCont_, "FLIGHT", &flight_, theme::fontBody());
 
   lv_obj_t *metrics = addMetricRow(fieldsCont_);
   addMetric(metrics, "DIST", &distance_);
@@ -163,23 +210,18 @@ void InfoPanel::create(lv_obj_t *parent) {
   addMetric(metrics, "SPD", &speed_);
 
   // Route is one block: the codes headline the leg, the airport names sit
-  // beneath it and ellipsize when they are too long for the panel.
+  // beneath it. The names get two lines each and ellipsize beyond that; the line
+  // holds roughly 40 characters, so "Chhatrapati Shivaji International, IN" fits
+  // on one and only the longest "Airport, City, CC" forms need the second.
+  // Measured worst case (both names on two lines) leaves 5 px spare at the
+  // bottom of the fields container.
   routeBlock_ = makeBlock(fieldsCont_);
   makeCaption(routeBlock_, "ROUTE");
   routeCodes_ = makeValue(routeBlock_, theme::fontTitle());
-  originName_ = makeValue(routeBlock_, theme::fontCaption());
+  originName_ = makeValue(routeBlock_, theme::fontCaption(), 2);
   lv_obj_set_style_text_color(originName_, theme::c(theme::kTextDim), 0);
-  destName_ = makeValue(routeBlock_, theme::fontCaption());
+  destName_ = makeValue(routeBlock_, theme::fontCaption(), 2);
   lv_obj_set_style_text_color(destName_, theme::c(theme::kTextDim), 0);
-
-  // Promote the primary aircraft line for a clearer hierarchy.
-  lv_obj_set_style_text_font(aircraft_, theme::fontTitle(), 0);
-
-  // Last child of the panel: the growing body above pushes it to the bottom.
-  statsLabel_ = lv_label_create(panel_);
-  lv_label_set_text(statsLabel_, "");
-  lv_obj_set_style_text_color(statsLabel_, theme::c(theme::kTextMuted), 0);
-  lv_obj_set_style_text_font(statsLabel_, theme::fontCaption(), 0);
 
   // Settings gear. IGNORE_LAYOUT keeps the flex column from placing it, so it
   // floats over the empty right-hand side of the clock card (the big time
@@ -211,11 +253,13 @@ bool InfoPanel::consumeSettingsRequest() {
 
 void InfoPanel::setStats(size_t inRange, long secondsSinceUpdate) {
   if (statsLabel_ == nullptr) return;
+  // Shorter than it once was: this now shares the date's row rather than owning
+  // a line of the panel, so "updated 12s ago" no longer fits.
   char buf[48];
   if (secondsSinceUpdate < 0) {
     snprintf(buf, sizeof(buf), "%u in range", static_cast<unsigned>(inRange));
   } else {
-    snprintf(buf, sizeof(buf), "%u in range " LV_SYMBOL_BULLET " updated %lds ago",
+    snprintf(buf, sizeof(buf), "%u in range " LV_SYMBOL_BULLET " %lds",
              static_cast<unsigned>(inRange), secondsSinceUpdate);
   }
   lv_label_set_text(statsLabel_, buf);
