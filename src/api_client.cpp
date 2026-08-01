@@ -237,7 +237,7 @@ bool fetchNearbyAircraft(float homeLat, float homeLon, int radiusNm,
     } else if (ac["alt_baro"].is<float>()) {
       dst.altitudeFt = static_cast<int>(ac["alt_baro"].as<float>());
     } else {
-      dst.altitudeFt = 0;
+      dst.altitudeFt = kAltitudeUnknown;
     }
 
     if (ac["gs"].is<float>()) {

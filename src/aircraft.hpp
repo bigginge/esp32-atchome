@@ -7,6 +7,8 @@
 static constexpr size_t kMaxAircraft = 32;
 static constexpr size_t kTrailLen = 12;
 static constexpr int kMaxAltitudeFt = 40000;
+static constexpr int kAltitudeUnknown = -9999;
+
 
 struct TrailPoint {
   float eastNm;
