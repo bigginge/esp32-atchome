@@ -366,7 +366,11 @@ void InfoPanel::showAircraft(const Aircraft *aircraft) {
   setField(distance_, distBuf);
 
   char altBuf[32];
-  snprintf(altBuf, sizeof(altBuf), "%d ft", aircraft->altitudeFt);
+  if (aircraft->altitudeFt == kAltitudeUnknown) {
+    snprintf(altBuf, sizeof(altBuf), "GND");
+  } else {
+    snprintf(altBuf, sizeof(altBuf), "%d ft", aircraft->altitudeFt);
+  }
   setField(altitude_, altBuf);
 
   if (aircraft->groundSpeedKts > 0.0f) {

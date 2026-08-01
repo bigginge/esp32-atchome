@@ -105,7 +105,7 @@ void drawText(lv_layer_t *layer, int32_t x, int32_t y, int32_t w,
 }  // namespace
 
 lv_color_t altitudeColor(int altitudeFt) {
-  if (altitudeFt <= 0) {
+  if (altitudeFt == kAltitudeUnknown) {
     return theme::c(theme::kGround);
   }
   const float n = altitudeNorm(altitudeFt);
@@ -1128,7 +1128,7 @@ void RadarView::seedStaticBlockers() {
 
 void RadarView::formatLabel(const Aircraft &ac, uint8_t form, char *buf, size_t n) {
   const char *id = ac.callsign[0] != '\0' ? ac.callsign : ac.hex;
-  const bool hasAlt = ac.altitudeFt > 0;
+  const bool hasAlt = ac.altitudeFt != kAltitudeUnknown;
   const int fl = (ac.altitudeFt + 50) / 100;
 
   switch (form) {
